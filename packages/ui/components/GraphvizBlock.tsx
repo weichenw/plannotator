@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { instance } from '@viz-js/viz';
+import DOMPurify from 'dompurify';
 import type { Block } from '../types';
 
 interface ViewBox {
@@ -174,8 +175,13 @@ export const GraphvizBlock: React.FC<{ block: Block }> = ({ block }) => {
           .replace(/fill="lightgray"/g, 'fill="var(--muted)"');
 
         if (!cancelled) {
-          naturalBoundsRef.current = parseViewBoxFromMarkup(cleaned);
-          setSvg(cleaned);
+          // Defense-in-depth: viz-js serializes DOT HTML-like labels to structured
+          // SVG/foreignObject and does not emit <script>, but sanitize the rendered
+          // SVG before injection so a future viz regression or crafted DOT label can't
+          // smuggle event handlers or scripts into the diagram DOM.
+          const safe = DOMPurify.sanitize(cleaned, { USE_PROFILES: { svg: true, svgFilters: true } });
+          naturalBoundsRef.current = parseViewBoxFromMarkup(safe);
+          setSvg(safe);
           setError(null);
         }
       } catch (err) {
