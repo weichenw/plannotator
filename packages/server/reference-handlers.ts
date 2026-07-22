@@ -24,7 +24,11 @@ import {
 	resolveMarkdownFile,
 	resolveUserPath,
 	isWithinProjectRoot,
+	getFileBrowserMaxFiles,
 	warmFileListCache,
+	ANNOTATABLE_DOC_REGEX,
+	MAX_ANNOTATABLE_FILE_BYTES,
+	isAnnotatableTextPath,
 } from "@plannotator/shared/resolve-file";
 import { htmlToMarkdown } from "@plannotator/shared/html-to-markdown";
 import { disabledSourceSave, type SourceFileSnapshot, type SourceSaveCapability } from "@plannotator/shared/source-save";
@@ -215,10 +219,17 @@ export async function handleDoc(req: Request, options: HandleDocOptions = {}): P
 	// HTML renders raw by default; `?convert=1` (set by the frontend when the session's
 	// --markdown preference is on) forces Turndown conversion instead.
 	const convert = url.searchParams.get("convert") === "1";
+	// `?doc=1` (set by the file browser) forces annotatable plain-text rendering
+	// for extensions that overlap CODE_FILE_REGEX (.yaml, .json, .toml, .ini,
+	// .xml). Without it, those paths keep the syntax-highlighted code-file
+	// popout response, so code-file links inside documents are unaffected.
+	const forceDoc = url.searchParams.get("doc") === "1";
+	const wantsDocRender = (path: string) =>
+		ANNOTATABLE_DOC_REGEX.test(path) && (forceDoc || !isCodeFilePath(path));
 	if (
 		resolvedBase &&
 		!isAbsoluteUserPath(requestedPath) &&
-		/\.(mdx?|txt|html?)$/i.test(requestedPath)
+		wantsDocRender(requestedPath)
 	) {
 		const fromBase = resolveUserPath(requestedPath, resolvedBase);
 		if (!isWithinAllowedRoots(fromBase, allowedRoots)) {
@@ -227,6 +238,9 @@ export async function handleDoc(req: Request, options: HandleDocOptions = {}): P
 		try {
 			const file = Bun.file(fromBase);
 			if (await file.exists()) {
+				if (file.size > MAX_ANNOTATABLE_FILE_BYTES) {
+					return Response.json({ error: "File too large (max 2MB)" }, { status: 413 });
+				}
 				const snapshot = readSourceFileSnapshot(fromBase);
 				const raw = snapshot.text;
 				const isHtml = /\.html?$/i.test(requestedPath);
@@ -268,7 +282,10 @@ export async function handleDoc(req: Request, options: HandleDocOptions = {}): P
 
 	// Code files: try literal resolve first; on miss, fall back to the smart
 	// resolver which walks the project for case-insensitive / suffix matches.
-	if (isCodeFilePath(requestedPath)) {
+	// Skipped when the client asked for doc rendering (`?doc=1`) on an
+	// annotatable plain-text path — those fall through to the markdown
+	// resolution below and render like .txt.
+	if (isCodeFilePath(requestedPath) && !(forceDoc && isAnnotatableTextPath(requestedPath))) {
 		const parsed = parseCodePath(requestedPath);
 		const cleanPath = parsed.filePath;
 		const literalPath = resolveUserPath(cleanPath, resolvedBase || projectRoot);
@@ -307,7 +324,7 @@ export async function handleDoc(req: Request, options: HandleDocOptions = {}): P
 
 		try {
 			const file = Bun.file(resolvedCode);
-			if (file.size > 2 * 1024 * 1024) {
+			if (file.size > MAX_ANNOTATABLE_FILE_BYTES) {
 				return Response.json({ error: "File too large (max 2MB)" }, { status: 413 });
 			}
 			const contents = await file.text();
@@ -358,6 +375,9 @@ export async function handleDoc(req: Request, options: HandleDocOptions = {}): P
 	}
 
 	try {
+		if (Bun.file(result.path).size > MAX_ANNOTATABLE_FILE_BYTES) {
+			return Response.json({ error: "File too large (max 2MB)" }, { status: 413 });
+		}
 		const snapshot = readSourceFileSnapshot(result.path);
 		return docJson({ markdown: snapshot.text, filepath: result.path, renderAs: "markdown" }, options, snapshot);
 	} catch {
@@ -542,13 +562,29 @@ export async function handleObsidianDoc(req: Request): Promise<Response> {
 
 // --- File Browser ---
 
-const FILE_BROWSER_EXTENSIONS = /\.(mdx?|txt|html?)$/i;
+const FILE_BROWSER_EXTENSIONS = ANNOTATABLE_DOC_REGEX;
 
 function includeWorkspaceFile(relativePath: string, _change: WorkspaceFileChange): boolean {
 	return FILE_BROWSER_EXTENSIONS.test(relativePath) && !isFileBrowserExcludedPath(relativePath);
 }
 
-async function walkFileBrowserFiles(dir: string, root: string, files: Set<string>): Promise<void> {
+type FileBrowserWalkState = {
+	files: Set<string>;
+	limit: number;
+	truncated: boolean;
+};
+
+function addFileBrowserFile(state: FileBrowserWalkState, relativePath: string): void {
+	if (state.files.has(relativePath)) return;
+	if (state.files.size >= state.limit) {
+		state.truncated = true;
+		return;
+	}
+	state.files.add(relativePath);
+}
+
+async function walkFileBrowserFiles(dir: string, root: string, state: FileBrowserWalkState): Promise<void> {
+	if (state.truncated) return;
 	let entries;
 	try {
 		entries = await readdir(dir, { withFileTypes: true });
@@ -557,14 +593,15 @@ async function walkFileBrowserFiles(dir: string, root: string, files: Set<string
 	}
 
 	for (const entry of entries) {
+		if (state.truncated) return;
 		const fullPath = join(dir, entry.name);
 		const relativePath = relative(root, fullPath).replace(/\\/g, "/");
 		if (entry.isDirectory()) {
 			if (isFileBrowserExcludedPath(relativePath)) continue;
-			await walkFileBrowserFiles(fullPath, root, files);
+			await walkFileBrowserFiles(fullPath, root, state);
 		} else if (entry.isFile() && FILE_BROWSER_EXTENSIONS.test(entry.name)) {
 			if (isFileBrowserExcludedPath(relativePath)) continue;
-			files.add(relativePath);
+			addFileBrowserFile(state, relativePath);
 		}
 	}
 }
@@ -586,16 +623,30 @@ export async function handleFileBrowserFiles(req: Request): Promise<Response> {
 	}
 
 	try {
-		const files = new Set<string>();
-		await walkFileBrowserFiles(resolvedDir, resolvedDir, files);
+		const state: FileBrowserWalkState = {
+			files: new Set<string>(),
+			limit: getFileBrowserMaxFiles(),
+			truncated: false,
+		};
+		// Seed the user's own modified/untracked files BEFORE the bulk walk: the
+		// walk fills the cap in raw readdir order and addFileBrowserFile drops
+		// everything once the cap latches — the one set of files that must never
+		// silently vanish from the browser is the ones the user just touched.
 		const workspaceStatus = filterWorkspaceStatusForDirectory(await getWorkspaceStatusForDirectory(resolvedDir), resolvedDir, includeWorkspaceFile);
 		for (const match of getWorkspaceStatusRelativePaths(workspaceStatus, resolvedDir, includeWorkspaceFile)) {
-			files.add(match);
+			addFileBrowserFile(state, match);
+			if (state.truncated) break;
 		}
-		const sortedFiles = [...files].sort();
+		await walkFileBrowserFiles(resolvedDir, resolvedDir, state);
+		const sortedFiles = [...state.files].sort();
 
 		const tree = buildFileTree(sortedFiles);
-		return Response.json({ tree, workspaceStatus });
+		return Response.json({
+			tree,
+			workspaceStatus,
+			truncated: state.truncated,
+			fileLimit: state.limit,
+		});
 	} catch {
 		return Response.json(
 			{ error: "Failed to list directory files" },

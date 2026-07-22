@@ -16,6 +16,7 @@ import type { AIChatEntry } from '../hooks/useAIChat';
 import type { AgentJobInfo, AgentCapabilities } from '@plannotator/ui/types';
 import type { DiffFile } from '../types';
 import type { AIProviderOption } from '@plannotator/ui/utils/aiProvider';
+import { artifactAnchorLabel, artifactAnnotationQuote } from '../utils/artifactAnnotations';
 
 export type ReviewSidebarTab = 'annotations' | 'ai' | 'agents';
 
@@ -70,6 +71,14 @@ interface ReviewSidebarProps {
   onAgentKillAll?: () => void;
   externalAnnotations?: Array<{ source?: string }>;
   onOpenJobDetail?: (jobId: string) => void;
+  onOpenGuide?: (jobId: string) => void;
+  /** Pass-through to AgentsTab — gates the sidebar's Guided Review mode on
+   *  file availability, mirroring the header's hasSearchableFiles gate on
+   *  the "Guide" badge/shortcut (see App.tsx). */
+  guideLaunchable?: boolean;
+  /** Pass-through to AgentsTab — gates each guide job card's "Open guide"
+   *  action on whether that job belongs to the current review context. */
+  canOpenGuideJob?: (job: import('@plannotator/ui/types').AgentJobInfo) => boolean;
 }
 
 const SuggestionPreview: React.FC<{ code: string; originalCode?: string; language?: string }> = ({ code, originalCode, language }) => {
@@ -163,6 +172,9 @@ export const ReviewSidebar: React.FC<ReviewSidebarProps> = /* React.memo */({
   onAgentKillAll,
   externalAnnotations,
   onOpenJobDetail,
+  onOpenGuide,
+  guideLaunchable,
+  canOpenGuideJob,
 }) => {
   const totalCount = annotations.length + (editorAnnotations?.length ?? 0) + (descriptionAnnotations?.length ?? 0) + (commentAnnotations?.length ?? 0);
   const [copied, setCopied] = useState(false);
@@ -338,8 +350,10 @@ export const ReviewSidebar: React.FC<ReviewSidebarProps> = /* React.memo */({
 
   const renderDescriptionAnnotationCard = (annotation: Annotation) => renderProseAnnotationCard({
     id: annotation.id,
-    label: 'PR description',
-    quote: annotation.originalText,
+    label: annotation.artifact
+      ? `${annotation.artifact.artifactKind} · ${artifactAnchorLabel(annotation.artifact.anchor)}`
+      : 'PR description',
+    quote: annotation.artifact ? artifactAnnotationQuote(annotation.artifact) : annotation.originalText,
     quoteClamp: 'line-clamp-1',
     note: annotation.text,
     author: annotation.author,
@@ -352,8 +366,10 @@ export const ReviewSidebar: React.FC<ReviewSidebarProps> = /* React.memo */({
 
   const renderCommentAnnotationCard = (annotation: CommentAnnotation) => renderProseAnnotationCard({
     id: annotation.id,
-    label: 'PR comment',
-    quote: annotation.commentBody,
+    label: annotation.artifact
+      ? `${annotation.artifact.artifactKind} · ${artifactAnchorLabel(annotation.artifact.anchor)}`
+      : 'PR comment',
+    quote: annotation.artifact ? artifactAnnotationQuote(annotation.artifact) : annotation.commentBody,
     note: annotation.text,
     author: annotation.commentAuthor,
     createdAt: annotation.createdAt,
@@ -542,6 +558,9 @@ export const ReviewSidebar: React.FC<ReviewSidebarProps> = /* React.memo */({
               onKillAll={onAgentKillAll ?? (() => {})}
               externalAnnotations={externalAnnotations ?? []}
               onOpenJobDetail={onOpenJobDetail}
+              onOpenGuide={onOpenGuide}
+              guideLaunchable={guideLaunchable}
+              canOpenGuideJob={canOpenGuideJob}
             />
           )}
 

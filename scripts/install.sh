@@ -40,12 +40,20 @@ EXTRAS_FLAG=""
 MODEL_INVOCABLE_FLAG=""
 NON_INTERACTIVE=0
 RECONFIGURE=0
+# Binary-only mode. Installs just the plannotator binary (to $INSTALL_DIR) and
+# no persistent state elsewhere — no sem sidecar, no agent-terminal runtime, no
+# skills, hooks, slash commands, or per-agent config (Claude, Codex, OpenCode,
+# Gemini, Kiro). Set by --minimal (1) / --no-minimal (0); -1 = neither flag
+# given (fall through to the PLANNOTATOR_MINIMAL env var). Resolved after arg
+# parsing so a flag overrides the env var in either direction.
+MINIMAL_FLAG=-1
 
 usage() {
     cat <<'USAGE'
 Usage: install.sh [--version <tag>] [--verify-attestation | --skip-attestation]
                   [--extras | --no-extras] [--model-invocable <list>|none]
-                  [--non-interactive] [--reconfigure] [--help]
+                  [--minimal | --no-minimal] [--non-interactive]
+                  [--reconfigure] [--help]
        install.sh <tag>
 
 Options:
@@ -63,6 +71,16 @@ Options:
   --model-invocable <l>  Comma-separated skill names to make model-invocable
                          (e.g. plannotator-review,plannotator-compound), or
                          "none". Skills are user-invoked-only by default.
+  --minimal              Install only the plannotator binary (aliased
+                         --binary-only). Skips the sem semantic-diff sidecar,
+                         the agent-terminal runtime, and every per-agent
+                         integration (skills, hooks, slash commands, and config
+                         for Claude, Codex, OpenCode, Gemini, and Kiro). No
+                         persistent state is written outside $HOME/.local/bin
+                         (a temp download file is still used and removed). Also
+                         enabled by exporting PLANNOTATOR_MINIMAL=1.
+  --no-minimal           Force a full install even when PLANNOTATOR_MINIMAL is
+                         set in the environment.
   --non-interactive      Never prompt, even in a terminal. Uses flags, then
                          saved answers from a previous run, then the defaults
                          (no extras, nothing model-invocable).
@@ -189,6 +207,24 @@ while [ $# -gt 0 ]; do
             RECONFIGURE=1
             shift
             ;;
+        --minimal|--binary-only)
+            if [ "$MINIMAL_FLAG" = "0" ]; then
+                echo "--minimal and --no-minimal are mutually exclusive" >&2
+                usage >&2
+                exit 1
+            fi
+            MINIMAL_FLAG=1
+            shift
+            ;;
+        --no-minimal)
+            if [ "$MINIMAL_FLAG" = "1" ]; then
+                echo "--no-minimal and --minimal are mutually exclusive" >&2
+                usage >&2
+                exit 1
+            fi
+            MINIMAL_FLAG=0
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -213,6 +249,18 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+# Resolve binary-only mode. Precedence: --minimal / --no-minimal flag >
+# PLANNOTATOR_MINIMAL env var > default (off). The env var lets `curl ... | bash`
+# runs opt in without a flag, matching how PLANNOTATOR_SKIP_SEM_INSTALL et al.
+# work; --no-minimal lets a flag override an env var that enables it.
+minimal=0
+case "${PLANNOTATOR_MINIMAL:-}" in
+    1|true|yes|TRUE|YES|True|Yes) minimal=1 ;;
+esac
+if [ "$MINIMAL_FLAG" -ne -1 ]; then
+    minimal="$MINIMAL_FLAG"
+fi
 
 case "$(uname -s)" in
     Darwin) os="darwin" ;;
@@ -267,9 +315,19 @@ verify_attestation=0
 # Crude grep against a flat boolean — PlannotatorConfig has no nested
 # verifyAttestation, so false positives are not a concern.
 # Resolve the data directory, expanding ~ the same way the runtime does.
+# Unset: an existing ~/.plannotator (legacy default) always wins; otherwise
+# an explicitly-set absolute XDG_DATA_HOME places it at
+# $XDG_DATA_HOME/plannotator; otherwise ~/.plannotator.
 _raw_dir="${PLANNOTATOR_DATA_DIR:-}"
 case "$_raw_dir" in
-    "")      _config_dir="$HOME/.plannotator" ;;
+    "")
+        _config_dir="$HOME/.plannotator"
+        if [ ! -d "$_config_dir" ]; then
+            case "${XDG_DATA_HOME:-}" in
+                /*) _config_dir="$XDG_DATA_HOME/plannotator" ;;
+            esac
+        fi
+        ;;
     "~")     _config_dir="$HOME" ;;
     "~/"*)   _config_dir="$HOME/${_raw_dir#\~/}" ;;
     *)       _config_dir="$_raw_dir" ;;
@@ -367,7 +425,7 @@ if [ "$verify_attestation" -eq 1 ]; then
     fi
 else
     echo "SHA256 verified. For build provenance verification, see"
-    echo "https://plannotator.ai/docs/getting-started/installation/#verifying-your-install"
+    echo "https://docs.plannotator.ai/open-source/start/installation#pin-or-verify-a-release"
 fi
 
 # Remove old binary first (handles Windows .exe and locked file issues)
@@ -378,6 +436,39 @@ chmod +x "$INSTALL_DIR/plannotator"
 
 echo ""
 echo "plannotator ${latest_tag} installed to ${INSTALL_DIR}/plannotator"
+
+# Print the PATH-setup hint if $INSTALL_DIR isn't already on PATH. Extracted so
+# both the normal flow and the --minimal early exit below can reuse it.
+print_path_advice() {
+    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
+        echo ""
+        echo "${INSTALL_DIR} is not in your PATH. Add it with:"
+        echo ""
+
+        case "$SHELL" in
+            */zsh)  shell_config="~/.zshrc" ;;
+            */bash) shell_config="~/.bashrc" ;;
+            *)      shell_config="your shell config" ;;
+        esac
+
+        echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ${shell_config}"
+        echo "  source ${shell_config}"
+    fi
+}
+
+# Binary-only mode stops here: the binary is installed, so print PATH advice and
+# exit before any sidecar download, agent integration, skill checkout, config
+# write, cache clear, or cleanup migration runs. No persistent state is written
+# outside $INSTALL_DIR (the temp download file was already cleaned up above; the
+# config dir may have been read, never written). See the MINIMAL_FLAG /
+# PLANNOTATOR_MINIMAL resolution near the top.
+if [ "$minimal" -eq 1 ]; then
+    print_path_advice
+    echo ""
+    echo "Minimal install complete — only the plannotator binary was installed."
+    echo "No skills, hooks, agent integrations, or config files were written."
+    exit 0
+fi
 
 sem_asset_for_platform() {
     case "$platform" in
@@ -496,20 +587,7 @@ install_agent_terminal_runtime() {
 install_sem_sidecar
 install_agent_terminal_runtime
 
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
-    echo ""
-    echo "${INSTALL_DIR} is not in your PATH. Add it with:"
-    echo ""
-
-    case "$SHELL" in
-        */zsh)  shell_config="~/.zshrc" ;;
-        */bash) shell_config="~/.bashrc" ;;
-        *)      shell_config="your shell config" ;;
-    esac
-
-    echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ${shell_config}"
-    echo "  source ${shell_config}"
-fi
+print_path_advice
 
 # --- Codex CLI / Desktop app support (only if Codex is installed or configured) ---
 # Codex stores config and state under $CODEX_HOME when set, falling back to
@@ -1016,10 +1094,10 @@ fi
 if [ "$extras_choice" = "yes" ] && [ "$extras_present" -eq 0 ]; then
     if [ "$can_prompt" -eq 1 ] && command -v npx >/dev/null 2>&1; then
         echo "Launching the skills CLI for the extras (pick your agents in its UI)..."
-        npx skills add backnotprop/plannotator/apps/skills/extra < /dev/tty || \
-            echo "skills CLI did not complete — install later with: npx skills add backnotprop/plannotator/apps/skills/extra"
+        npx skills add backnotprop/plannotator/apps/skills/extra --global < /dev/tty || \
+            echo "skills CLI did not complete — install later with: npx skills add backnotprop/plannotator/apps/skills/extra --global"
     else
-        echo "Install the extras with: npx skills add backnotprop/plannotator/apps/skills/extra"
+        echo "Install the extras with: npx skills add backnotprop/plannotator/apps/skills/extra --global"
     fi
 fi
 
@@ -1374,7 +1452,7 @@ echo "The /plannotator-review, /plannotator-annotate, and /plannotator-last comm
 if [ "$extras_choice" != "yes" ]; then
     echo ""
     echo "Optional skills (compound planning, setup-goal, visual explainer):"
-    echo "  npx skills add backnotprop/plannotator/apps/skills/extra"
+    echo "  npx skills add backnotprop/plannotator/apps/skills/extra --global"
 fi
 
 # Warn if plannotator is configured in both settings.json hooks AND the plugin (causes double execution)

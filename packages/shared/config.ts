@@ -10,24 +10,8 @@ import { getPlannotatorDataDir } from "./data-dir";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { execSync } from "child_process";
 
-export type DefaultDiffType = 'uncommitted' | 'unstaged' | 'staged' | 'merge-base' | 'all';
-export type DiffLineBgIntensity = 'subtle' | 'normal' | 'strong';
-
-export interface DiffOptions {
-  diffStyle?: 'split' | 'unified';
-  overflow?: 'scroll' | 'wrap';
-  diffIndicators?: 'bars' | 'classic' | 'none';
-  lineDiffType?: 'word-alt' | 'word' | 'char' | 'none';
-  showLineNumbers?: boolean;
-  showDiffBackground?: boolean;
-  fontFamily?: string;
-  fontSize?: string;
-  tabSize?: number;
-  hideWhitespace?: boolean;
-  expandUnchanged?: boolean;
-  defaultDiffType?: DefaultDiffType;
-  lineBgIntensity?: DiffLineBgIntensity;
-}
+import type { DefaultDiffType, DiffLineBgIntensity, DiffOptions } from '@plannotator/core/config-types';
+export type { DefaultDiffType, DiffLineBgIntensity, DiffOptions };
 
 /** Single conventional comment label entry stored in config.json */
 export interface CCLabelConfig {
@@ -122,6 +106,14 @@ export interface PlannotatorConfig {
    */
   jina?: boolean;
   /**
+   * Save per-file version history when annotating local files. Powers the
+   * annotate version diff ("what changed since I last looked"). NOTE: this
+   * writes a copy of each annotated file's content under
+   * ~/.plannotator/history/ (or PLANNOTATOR_DATA_DIR). Set to false to keep
+   * annotate sessions fully stateless. Default: true.
+   */
+  annotateHistory?: boolean;
+  /**
    * Inject a Plannotator Flavored Markdown reminder into every EnterPlanMode
    * call so the agent is aware it can enrich plans with code-file links,
    * callouts, tables, diagrams, task lists, and the other PFM extensions.
@@ -142,6 +134,16 @@ export interface PlannotatorConfig {
    * env var value, which takes precedence over this setting.
    */
   share?: "enabled" | "disabled";
+  /**
+   * Pass `--sandbox enabled` when launching Cursor's `agent` CLI for review
+   * jobs. When true (default), review jobs run with Cursor's sandbox forced
+   * on as part of their read-only posture. Set to false on systems where
+   * Cursor's sandbox cannot start (e.g. NixOS / AppArmor-restricted Linux):
+   * the flag pair is then OMITTED entirely, deferring to the user's own
+   * Cursor Agent sandbox configuration. Mirrors the
+   * PLANNOTATOR_CURSOR_SANDBOX env var, which takes precedence.
+   */
+  cursorSandbox?: boolean;
 }
 
 const CONFIG_DIR = getPlannotatorDataDir();
@@ -222,12 +224,30 @@ export function getServerConfig(gitUser: string | null): {
 }
 
 /**
- * Read the user's preferred default diff type from config, falling back to 'unstaged'.
+ * Read the user's preferred default diff type from config, falling back to
+ * 'since-base' (the composite "what would GitHub show" view). Users with an
+ * explicit defaultDiffType keep their choice.
  */
 export function resolveDefaultDiffType(cfg?: PlannotatorConfig): DefaultDiffType {
   const v = cfg?.diffOptions?.defaultDiffType as string | undefined;
   if (v === 'branch') return 'merge-base';
-  return v === 'uncommitted' || v === 'unstaged' || v === 'staged' || v === 'merge-base' || v === 'all' ? v : 'unstaged';
+  return v === 'since-base' || v === 'uncommitted' || v === 'unstaged' || v === 'staged' || v === 'merge-base' || v === 'all' ? v : 'since-base';
+}
+
+/**
+ * Coerce a config.json value that should be a boolean. JSON parsing preserves
+ * whatever type the user typed, so a hand-edited `"false"` (quoted) arrives as
+ * a string and would fail `=== false` checks downstream. Accepts real booleans
+ * plus "true"/"false"/"1"/"0" strings; anything else falls back to the default.
+ */
+function coerceConfigBoolean(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase();
+    if (v === "true" || v === "1") return true;
+    if (v === "false" || v === "0") return false;
+  }
+  return fallback;
 }
 
 /**
@@ -241,8 +261,7 @@ export function resolveUseGlimpse(config: PlannotatorConfig): boolean {
   if (envVal !== undefined) {
     return envVal === "1" || envVal.toLowerCase() === "true";
   }
-  if (config.glimpse !== undefined) return config.glimpse;
-  return true;
+  return coerceConfigBoolean(config.glimpse, true);
 }
 
 /**
@@ -251,6 +270,20 @@ export function resolveUseGlimpse(config: PlannotatorConfig): boolean {
  * Priority (highest wins):
  *   --no-jina CLI flag  →  PLANNOTATOR_JINA env var  →  config.jina  →  default true
  */
+/**
+ * Resolve whether annotate mode saves per-file version history.
+ *
+ * Priority (highest wins):
+ *   PLANNOTATOR_ANNOTATE_HISTORY env var  →  config.annotateHistory  →  default true
+ */
+export function resolveAnnotateHistory(config: PlannotatorConfig): boolean {
+  const envVal = process.env.PLANNOTATOR_ANNOTATE_HISTORY;
+  if (envVal !== undefined) {
+    return envVal === "1" || envVal.toLowerCase() === "true";
+  }
+  return coerceConfigBoolean(config.annotateHistory, true);
+}
+
 export function resolveUseJina(cliNoJina: boolean, config: PlannotatorConfig): boolean {
   // CLI flag has highest priority
   if (cliNoJina) return false;
@@ -261,11 +294,8 @@ export function resolveUseJina(cliNoJina: boolean, config: PlannotatorConfig): b
     return envVal === "1" || envVal.toLowerCase() === "true";
   }
 
-  // Config file
-  if (config.jina !== undefined) return config.jina;
-
-  // Default: enabled
-  return true;
+  // Config file (default: enabled)
+  return coerceConfigBoolean(config.jina, true);
 }
 
 /**
@@ -279,4 +309,23 @@ export function resolveSharingEnabled(config: PlannotatorConfig): boolean {
   if (envVal !== undefined) return envVal !== "disabled";
   if (config.share !== undefined) return config.share !== "disabled";
   return true;
+}
+
+/**
+ * Resolve whether Cursor review jobs pass `--sandbox enabled` to the `agent` CLI.
+ *
+ * Priority (highest wins):
+ *   PLANNOTATOR_CURSOR_SANDBOX env var  →  config.cursorSandbox  →  default true
+ *
+ * Env values `0` / `false` / `disabled` turn the flag off (the pair is omitted
+ * from the argv, deferring to the user's own Cursor Agent configuration);
+ * anything else — including `1` / `true` / `enabled` — keeps the default.
+ */
+export function resolveCursorSandbox(config: PlannotatorConfig): boolean {
+  const envVal = process.env.PLANNOTATOR_CURSOR_SANDBOX;
+  if (envVal !== undefined) {
+    const v = envVal.toLowerCase();
+    return v !== "0" && v !== "false" && v !== "disabled";
+  }
+  return coerceConfigBoolean(config.cursorSandbox, true);
 }

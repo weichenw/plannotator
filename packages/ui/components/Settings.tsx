@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import type { Origin } from '@plannotator/shared/agents';
-import type { DiffLineBgIntensity } from '@plannotator/shared/config';
-import { configStore, useConfigValue } from '../config';
+import type { Origin } from '@plannotator/core/agents';
+import type { DiffLineBgIntensity } from '@plannotator/core/config-types';
+import { configStore, useConfigValue, setReviewPanelView, setReviewDefaultDiffType } from '../config';
 import { loadDiffFont } from '../utils/diffFonts';
 import { TaterSpritePullup } from './TaterSpritePullup';
-import { getIdentity, regenerateIdentity, setCustomIdentity } from '../utils/identity';
+import { getIdentity, regenerateIdentity, setCustomIdentity, isIdentityEditable } from '../utils/identity';
 import { GitUser } from '../icons/GitUser';
 import {
   getObsidianSettings,
@@ -78,7 +78,7 @@ interface SettingsProps {
   onTaterModeChange: (enabled: boolean) => void;
   onIdentityChange?: (oldIdentity: string, newIdentity: string) => void;
   origin?: Origin | null;
-  mode?: 'plan' | 'review';
+  mode?: 'plan' | 'annotate' | 'review';
   onUIPreferencesChange?: (prefs: UIPreferences) => void;
   /** Externally controlled open state (for mobile menu integration) */
   externalOpen?: boolean;
@@ -87,6 +87,12 @@ interface SettingsProps {
   aiProviders?: Array<{ id: string; name: string; capabilities: Record<string, boolean>; models?: Array<{ id: string; label: string; default?: boolean }> }>;
   /** Git user name from `git config user.name`, for quick identity set */
   gitUser?: string;
+  /** Current session is a local git review where since-base ISN'T offered
+   *  (base ref unresolvable) — the Git tab shows a note that the Git-status
+   *  preference can't take effect in THIS repo. */
+  sinceBaseUnavailable?: boolean;
+  /** Override Obsidian vault detection (default = GET /api/obsidian/vaults). */
+  onDetectObsidianVaults?: () => Promise<string[]>;
 }
 
 // --- Review-mode Display tab (diff display options) ---
@@ -129,10 +135,13 @@ export const LINE_BG_INTENSITY_OPTIONS: { value: DiffLineBgIntensity; label: str
   { value: 'strong', label: 'Strong' },
 ];
 const DEFAULT_DIFF_TYPE_OPTIONS = [
-  { value: 'uncommitted' as const, label: 'All Changes', description: "Everything you've changed since your last commit" },
+  // "All Changes" belongs to since-base (the flagship composite); uncommitted
+  // reverts to its plain name so the two stay distinguishable side by side.
+  { value: 'since-base' as const, label: 'All Changes (Recommended)', description: "Everything since your branch split from main — committed, uncommitted, and untracked" },
+  { value: 'uncommitted' as const, label: 'Uncommitted', description: "Everything you've changed since your last commit" },
   { value: 'unstaged' as const, label: 'Unstaged', description: "Only changes you haven't staged yet" },
   { value: 'staged' as const, label: 'Staged', description: "Only changes you've staged for commit" },
-  { value: 'merge-base' as const, label: 'Committed', description: "Everything you've committed on this branch" },
+  { value: 'merge-base' as const, label: 'Committed changes (PR view)', description: "Everything you've committed on this branch" },
   { value: 'all' as const, label: 'All Files (HEAD)', description: "Every tracked file at HEAD, shown as additions" },
 ];
 
@@ -190,10 +199,39 @@ function ToggleSwitch({ checked, onChange, label, description }: {
   );
 }
 
-const GitTab: React.FC = () => {
+const GitTab: React.FC<{ sinceBaseUnavailable?: boolean }> = ({ sinceBaseUnavailable }) => {
   const defaultDiffType = useConfigValue('defaultDiffType');
+  const reviewPanelView = useConfigValue('reviewPanelView');
   return (
-    <div className="space-y-2">
+    <div className="space-y-5">
+      <div className="space-y-2">
+        <div>
+          <div className="text-sm font-medium">Default review view</div>
+          <div className="text-xs text-muted-foreground">Which panel a code review opens in</div>
+          {/* This is a GLOBAL preference — never hide the options because the
+              CURRENT repo can't serve them; just say so. Without this note,
+              picking Git status on a repo whose base ref doesn't resolve
+              silently falls back to Tree and the setting looks broken. */}
+          {sinceBaseUnavailable && (
+            <div className="text-xs text-warning mt-1">
+              Git status view isn't available in this repository (its base branch
+              couldn't be resolved) — reviews here open in Tree. The preference
+              still applies in repositories where it works.
+            </div>
+          )}
+        </div>
+        {/* No Commits option here: the Commits view is session-only (entered
+            via the panel toggle) and is never the opening view. */}
+        <SegmentedControl
+          options={[
+            { value: 'sections' as const, label: 'Git status' },
+            { value: 'tree' as const, label: 'Tree' },
+          ]}
+          value={reviewPanelView}
+          onChange={setReviewPanelView}
+        />
+      </div>
+      <div className="space-y-2">
       <div>
         <div className="text-sm font-medium">Default Diff View</div>
         <div className="text-xs text-muted-foreground">Which changes to show when you open a code review</div>
@@ -203,7 +241,9 @@ const GitTab: React.FC = () => {
           <button
             key={opt.value}
             type="button"
-            onClick={() => configStore.set('defaultDiffType', opt.value)}
+            // Coupling (sections ⟺ since-base) lives in the shared setter —
+            // never write the pair by hand (see config/reviewView).
+            onClick={() => setReviewDefaultDiffType(opt.value)}
             className={`w-full flex items-start gap-3 p-3 rounded-lg border transition-colors text-left ${
               defaultDiffType === opt.value
                 ? 'border-primary bg-primary/5'
@@ -223,6 +263,7 @@ const GitTab: React.FC = () => {
             </div>
           </button>
         ))}
+      </div>
       </div>
     </div>
   );
@@ -610,7 +651,7 @@ const CommentsTab: React.FC = () => {
   );
 };
 
-export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange, onIdentityChange, origin, mode = 'plan', onUIPreferencesChange, externalOpen, onExternalClose, aiProviders = [], gitUser }) => {
+export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange, onIdentityChange, origin, mode = 'plan', onUIPreferencesChange, externalOpen, onExternalClose, aiProviders = [], gitUser, sinceBaseUnavailable, onDetectObsidianVaults }) => {
   const [showDialog, setShowDialog] = useState(false);
   const [themePreview, setThemePreview] = useState(false);
 
@@ -745,13 +786,14 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
   useEffect(() => {
     if (obsidian.enabled && detectedVaults.length === 0 && !vaultsLoading) {
       setVaultsLoading(true);
-      fetch('/api/obsidian/vaults')
-        .then(res => res.json())
-        .then((data: { vaults: string[] }) => {
-          setDetectedVaults(data.vaults || []);
+      const detect = onDetectObsidianVaults
+        ?? (() => fetch('/api/obsidian/vaults').then(res => res.json()).then((data: { vaults: string[] }) => data.vaults || []));
+      detect()
+        .then((vaults: string[]) => {
+          setDetectedVaults(vaults || []);
           // Auto-select first vault if none set
-          if (data.vaults?.length > 0 && !obsidian.vaultPath) {
-            handleObsidianChange({ vaultPath: data.vaults[0] });
+          if (vaults?.length > 0 && !obsidian.vaultPath) {
+            handleObsidianChange({ vaultPath: vaults[0] });
           }
         })
         .catch(() => setDetectedVaults([]))
@@ -845,6 +887,12 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
     if (!gitUser) return;
     handleIdentitySave(gitUser);
   };
+
+  // When a host owns identity (e.g. a logged-in user whose author is server-stamped),
+  // hide the rename/regenerate controls so a local name can't diverge from it.
+  // Default (Plannotator cookie identity) is editable, so this is true and the
+  // controls render exactly as before.
+  const identityEditable = isIdentityEditable();
 
   return (
     <>
@@ -955,21 +1003,27 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                         Used when sharing annotations with others
                       </div>
                       <div className="flex items-center gap-2">
-                        <input
-                          key={identity}
-                          type="text"
-                          defaultValue={identity}
-                          onBlur={(e) => handleIdentitySave(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') {
-                              handleIdentitySave((e.target as HTMLInputElement).value);
-                              (e.target as HTMLInputElement).blur();
-                            }
-                          }}
-                          className="flex-1 px-3 py-2 bg-muted rounded-lg text-xs font-mono truncate border border-transparent focus:border-primary/50 focus:outline-none transition-colors"
-                          placeholder="Enter your name..."
-                        />
-                        {gitUser && (
+                        {identityEditable ? (
+                          <input
+                            key={identity}
+                            type="text"
+                            defaultValue={identity}
+                            onBlur={(e) => handleIdentitySave(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                handleIdentitySave((e.target as HTMLInputElement).value);
+                                (e.target as HTMLInputElement).blur();
+                              }
+                            }}
+                            className="flex-1 px-3 py-2 bg-muted rounded-lg text-xs font-mono truncate border border-transparent focus:border-primary/50 focus:outline-none transition-colors"
+                            placeholder="Enter your name..."
+                          />
+                        ) : (
+                          <div className="flex-1 px-3 py-2 bg-muted rounded-lg text-xs font-mono truncate border border-transparent">
+                            {identity}
+                          </div>
+                        )}
+                        {identityEditable && gitUser && (
                           <button
                             onClick={handleUseGitName}
                             onMouseDown={(e) => e.preventDefault()}
@@ -979,16 +1033,18 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                             <GitUser className="w-5 h-5" />
                           </button>
                         )}
-                        <button
-                          onClick={handleRegenerateIdentity}
-                          onMouseDown={(e) => e.preventDefault()}
-                          className="p-2 rounded-lg bg-muted hover:bg-muted/80 text-muted-foreground hover:text-foreground transition-colors"
-                          title="Regenerate random identity"
-                        >
-                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                          </svg>
-                        </button>
+                        {identityEditable && (
+                          <button
+                            onClick={handleRegenerateIdentity}
+                            onMouseDown={(e) => e.preventDefault()}
+                            className="p-2 rounded-lg bg-muted hover:bg-muted/80 text-muted-foreground hover:text-foreground transition-colors"
+                            title="Regenerate random identity"
+                          >
+                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                          </button>
+                        )}
                       </div>
                     </div>
 
@@ -1139,7 +1195,7 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
 
                 {/* === GIT TAB === */}
                 {activeTab === 'git' && mode === 'review' && (
-                  <GitTab />
+                  <GitTab sinceBaseUnavailable={sinceBaseUnavailable} />
                 )}
 
                 {/* === DISPLAY TAB === */}

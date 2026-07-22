@@ -1,6 +1,6 @@
 import { describe, it, expect } from "bun:test";
-import { exportReviewFeedback } from "./exportFeedback";
-import type { CodeAnnotation } from "@plannotator/ui/types";
+import { buildProseFeedback, exportReviewFeedback } from "./exportFeedback";
+import { AnnotationType, type Annotation, type CodeAnnotation, type CommentAnnotation } from "@plannotator/ui/types";
 import type { PRMetadata } from "@plannotator/shared/pr-types";
 
 const ann = (overrides: Partial<CodeAnnotation> = {}): CodeAnnotation => ({
@@ -315,5 +315,127 @@ describe("exportReviewFeedback", () => {
     expect(result).toContain("line issue");
     expect(result).toContain("## General");
     expect(result).toContain("review-wide note");
+  });
+
+  it("labels the header with short sha + subject for a commit diff", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const result = exportReviewFeedback([ann({ commitSha: sha })], undefined, {
+      mode: `commit:${sha}`,
+      commitSubject: "fix: broken widget",
+    });
+    expect(result).toContain("**Diff:** Commit `0123456` — fix: broken widget (diff vs its parent)");
+    // Anchor matches the header — no mismatch note.
+    expect(result).not.toContain("anchored");
+  });
+
+  it("labels commit-anchored annotations exported under a different diff", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const result = exportReviewFeedback(
+      [ann({ commitSha: sha, commitSubject: "feat: add widget" })],
+      undefined,
+      { mode: "since-base", base: "origin/main" },
+    );
+    expect(result).toContain('_Made on commit `0123456` ("feat: add widget") — anchored to that commit\'s diff, not the diff above._');
+  });
+
+  it("labels working-tree annotations exported under a commit diff", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const result = exportReviewFeedback([ann()], undefined, { mode: `commit:${sha}` });
+    expect(result).toContain("_Made on a working-tree diff, not commit `0123456` — anchored there._");
+  });
+
+  it("does not label annotations sent from the commit they were made on", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const result = exportReviewFeedback(
+      [ann({ commitSha: sha })],
+      undefined,
+      { mode: `commit:${sha}` },
+    );
+    expect(result).not.toContain("anchored");
+  });
+
+  it("renders readable GitButler targets and preserves annotation provenance", () => {
+    const result = exportReviewFeedback(
+      [ann({
+        gitButlerDiffType: "gitbutler:branch:feature%2Fapi",
+        gitButlerDiffLabel: "Branch: feature/api (committed changes)",
+        gitButlerBase: "abc123",
+        gitButlerSnapshotId: "snapshot-a",
+      })],
+      undefined,
+      { mode: "gitbutler:branch:feature%2Fweb", base: "abc123", snapshotId: "snapshot-b" },
+    );
+
+    expect(result).toContain("**Diff:** GitButler branch `feature/web` (committed changes)");
+    expect(result).toContain("_Made on Branch: feature/api (committed changes) — anchored to that GitButler diff, not the diff above._");
+  });
+
+  it("labels GitButler annotations after the same target refreshes to a new snapshot", () => {
+    const result = exportReviewFeedback(
+      [ann({
+        gitButlerDiffType: "gitbutler:workspace",
+        gitButlerDiffLabel: "GitButler workspace (all applied changes)",
+        gitButlerBase: "abc123",
+        gitButlerSnapshotId: "snapshot-a",
+      })],
+      undefined,
+      { mode: "gitbutler:workspace", base: "abc123", snapshotId: "snapshot-b" },
+    );
+    expect(result).toContain("anchored to that GitButler diff");
+  });
+});
+
+describe("buildProseFeedback — artifact annotations", () => {
+  const artifact = {
+    artifactId: "pr-artifact-video",
+    artifactName: "Demo recording",
+    artifactUrl: "https://example.com/demo.webm",
+    artifactKind: "video" as const,
+    sourceUrl: "https://github.com/acme/widgets/pull/42#issuecomment-9",
+    anchor: { kind: "video" as const, timestamp: 83.4 },
+  };
+
+  it("exports a timestamped comment artifact as reply context for agent and GitHub delivery", () => {
+    const annotation: CommentAnnotation = {
+      id: "artifact-note",
+      commentId: "issuecomment-9",
+      commentAuthor: "alice",
+      commentBody: "Here is the UI recording.",
+      text: "The panel jumps at this moment.",
+      createdAt: 1,
+      artifact,
+    };
+
+    const output = buildProseFeedback([], [annotation], undefined);
+    expect(output).toContain("# PR Artifact Feedback");
+    expect(output).toContain("Demo recording — Video at 1:23");
+    expect(output).toContain("In reply to the artifact source comment by @alice");
+    expect(output).toContain("> Here is the UI recording.");
+    expect(output).toContain("https://github.com/acme/widgets/pull/42#issuecomment-9");
+  });
+
+  it("keeps description artifact feedback separate from PR-description text anchors", () => {
+    const annotation: Annotation = {
+      id: "image-note",
+      blockId: "",
+      startOffset: 0,
+      endOffset: 0,
+      type: AnnotationType.GLOBAL_COMMENT,
+      text: "Crop this more tightly.",
+      originalText: "",
+      createdA: 1,
+      artifact: {
+        ...artifact,
+        artifactId: "pr-artifact-image",
+        artifactName: "Hero image",
+        artifactKind: "image",
+        anchor: { kind: "image", x: 0.25, y: 0.4 },
+      },
+    };
+
+    const output = buildProseFeedback([annotation], [], "![Hero image](https://example.com/hero.png)");
+    expect(output).toContain("Hero image — Pin at 25%, 40%");
+    expect(output).toContain("Regarding an artifact in the PR description.");
+    expect(output).toContain("Crop this more tightly.");
   });
 });

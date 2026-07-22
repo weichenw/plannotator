@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from 'react';
 import { toast, Toaster } from 'sonner';
 import { type Origin, getAgentName } from '@plannotator/shared/agents';
+import { shouldStripFrontmatter } from '@plannotator/shared/annotatable';
 import { annotateFileFeedback, annotateMessageFeedback } from '@plannotator/shared/feedback-templates';
 import { parseMarkdownToBlocks, exportAnnotations, exportLinkedDocAnnotations, exportEditorAnnotations, exportCodeFileAnnotations, exportMessageAnnotations, extractFrontmatter, wrapFeedbackForAgent, Frontmatter, type LinkedDocAnnotationEntry, type MessageAnnotationEntry } from '@plannotator/ui/utils/parser';
 import { Viewer, ViewerHandle } from '@plannotator/ui/components/Viewer';
@@ -48,7 +49,7 @@ import { usePrintMode } from '@plannotator/ui/hooks/usePrintMode';
 import { useResizablePanel } from '@plannotator/ui/hooks/useResizablePanel';
 import { ResizeHandle } from '@plannotator/ui/components/ResizeHandle';
 import { OverlayScrollArea } from '@plannotator/ui/components/OverlayScrollArea';
-import { ScrollViewportContext } from '@plannotator/ui/hooks/useScrollViewport';
+import { ScrollViewportProvider } from '@plannotator/ui/hooks/useScrollViewport';
 import { useOverlayViewport } from '@plannotator/ui/hooks/useOverlayViewport';
 import { useIsMobile } from '@plannotator/ui/hooks/useIsMobile';
 import {
@@ -91,6 +92,7 @@ import type { AIContext } from '@plannotator/ai';
 import type { CommentAskAIContext } from '@plannotator/ui/components/CommentPopover';
 import {
   hasSourceSaveConflictSnapshot,
+  isSourceSaveFilePath,
   type SourceSaveCapability,
   type SourceSaveResponse,
 } from '@plannotator/shared/source-save';
@@ -101,7 +103,12 @@ import type { AgentTerminalCapability } from '@plannotator/shared/agent-terminal
 // same env var on the server side so V2/V3 stay paired.
 import { DEMO_PLAN_CONTENT as DEFAULT_DEMO_PLAN_CONTENT } from './demoPlan';
 import { DIFF_DEMO_PLAN_CONTENT } from './demoPlanDiffDemo';
-import { canUseAnnotateWideMode, resolveWideModeExitLayout, type WideModeLayoutSnapshot, type WideModeType } from './wideMode';
+import { canUseAnnotateWideMode, resolveWideModeExitLayout, type WideModeLayoutSnapshot, type WideModeType } from '@plannotator/ui/utils/wideMode';
+import {
+  annotateSidebarShortcuts,
+  useAnnotateSidebarShortcuts,
+  useDoubleTapShortcuts,
+} from '@plannotator/ui/shortcuts';
 const USE_DIFF_DEMO =
   import.meta.env.VITE_DIFF_DEMO === '1' ||
   import.meta.env.VITE_DIFF_DEMO === 'true';
@@ -245,6 +252,9 @@ const feedbackLossDescription = (annotationCount: number, hasDirectEdits: boolea
 
 type SourceFileEditWarningAction = 'send-feedback' | 'approve' | 'close';
 
+/** Hint shown following the cursor while hovering a sidebar/panel resize handle. */
+const RESIZE_HANDLE_TOOLTIP = 'Click to close · Drag to resize';
+
 const App: React.FC = () => {
   const [markdown, setMarkdown] = useState(DEMO_PLAN_CONTENT);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -258,8 +268,28 @@ const App: React.FC = () => {
   const editableDocuments = useEditableDocuments();
   const activeEditableDocument = editableDocuments.activeDocument;
   const displayedMarkdown = activeEditableDocument?.currentText ?? markdown;
-  const frontmatter = useMemo(() => extractFrontmatter(displayedMarkdown).frontmatter, [displayedMarkdown]);
-  const blocks = useMemo(() => parseMarkdownToBlocks(displayedMarkdown), [displayedMarkdown]);
+  const [sourceFilePath, setSourceFilePath] = useState<string | undefined>();
+  // Mirrors linkedDocHook.filepath (declared later) so the parse memos below
+  // can key frontmatter behavior off the ACTIVE document's path. Kept in sync
+  // by an effect after the hook is created.
+  const [linkedDocParsePath, setLinkedDocParsePath] = useState<string | null>(null);
+  const activeParseDocPath = linkedDocParsePath ?? sourceFilePath;
+  // Frontmatter stripping is a markdown convention — for non-markdown
+  // annotatable sources (.yaml/.txt/…) a leading `--- … ---` pair is real
+  // content (multi-document YAML), so it must survive parsing.
+  const parseFrontmatter = shouldStripFrontmatter(activeParseDocPath);
+  const parseFrontmatterRef = useRef(parseFrontmatter);
+  useEffect(() => {
+    parseFrontmatterRef.current = parseFrontmatter;
+  }, [parseFrontmatter]);
+  const frontmatter = useMemo(
+    () => (parseFrontmatter ? extractFrontmatter(displayedMarkdown).frontmatter : null),
+    [displayedMarkdown, parseFrontmatter],
+  );
+  const blocks = useMemo(
+    () => parseMarkdownToBlocks(displayedMarkdown, { frontmatter: parseFrontmatter }),
+    [displayedMarkdown, parseFrontmatter],
+  );
   const [showExport, setShowExport] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [showFeedbackPrompt, setShowFeedbackPrompt] = useState(false);
@@ -367,6 +397,7 @@ const App: React.FC = () => {
   // card-chromed markdown column. Branch the document-area containers on this.
   const isHtmlSurface = renderAs === 'html';
   const [rawHtml, setRawHtml] = useState('');
+  const [htmlDiffHtml, setHtmlDiffHtml] = useState<string | null>(null);
   const [shareHtml, setShareHtml] = useState('');
   // Session-level force-markdown preference (`--markdown`). When set, folder/linked HTML
   // files are converted instead of rendered raw — threaded into /api/doc as &convert=1.
@@ -374,7 +405,6 @@ const App: React.FC = () => {
   // Hide the floating HTML annotation controls (toolstrip + action cluster) so the
   // user can read the rendered page unobstructed. Selections/annotations are unaffected.
   const [htmlToolsHidden, setHtmlToolsHidden] = useState(false);
-  const [sourceFilePath, setSourceFilePath] = useState<string | undefined>();
   const [imageBaseDir, setImageBaseDir] = useState<string | undefined>(undefined);
   const [isLoading, setIsLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -447,6 +477,8 @@ const App: React.FC = () => {
     storageKey: 'plannotator-panel-width',
     // Drag the right panel skinny → snap it shut (matches the contents sidebar).
     onSnapClose: () => setIsPanelOpen(false),
+    // Single click on the handle (no drag) collapses it.
+    onClick: () => setIsPanelOpen(false),
     // Render-free drag: write the live width to a :root var the panel reads,
     // so dragging never re-renders this (heavy) App.
     apply: (w) => document.documentElement.style.setProperty('--rpanel-w', `${w}px`),
@@ -456,6 +488,8 @@ const App: React.FC = () => {
     defaultWidth: 240, minWidth: 160, maxWidth: 400, side: 'left',
     // Drag the contents panel skinny → snap it shut (prototype behavior).
     onSnapClose: sidebar.close,
+    // Single click on the handle (no drag) collapses it.
+    onClick: sidebar.close,
     // Render-free drag: write the live width to a :root var the panel reads.
     apply: (w) => document.documentElement.style.setProperty('--toc-w', `${w}px`),
   });
@@ -466,6 +500,8 @@ const App: React.FC = () => {
     maxWidth: 640,
     side: 'left',
     onSnapClose: () => setIsAgentTerminalOpen(false),
+    // Single click on the handle (no drag) collapses it.
+    onClick: () => hideAgentTerminal(),
     apply: (w) => document.documentElement.style.setProperty('--agent-terminal-w', `${w}px`),
   });
   const isResizing = panelResize.isDragging || tocResize.isDragging || agentTerminalResize.isDragging;
@@ -650,8 +686,14 @@ const App: React.FC = () => {
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [isPlanDiffActive]);
 
-  // Plan diff computation
-  const planDiff = usePlanDiff(markdown, previousPlan, versionInfo);
+  // Plan diff computation. On the HTML surface the diff is rendered as the real
+  // page with inline highlights (htmlDiffHtml) instead of the markdown block diff,
+  // so suppress the markdown diff path there (markdown is empty for HTML).
+  const planDiff = usePlanDiff(
+    markdown,
+    isHtmlSurface ? null : previousPlan,
+    isHtmlSurface ? null : versionInfo,
+  );
   const warnFinishEditingFirst = useCallback((target: 'versions' | 'diff') => {
     toast('Finish editing first', {
       description: target === 'versions'
@@ -747,6 +789,13 @@ const App: React.FC = () => {
     onAfterBack: restoreLinkedDocumentEditableKey,
   });
 
+  // Keep the early parse-path mirror in sync with the active linked doc so
+  // the blocks/frontmatter memos (declared before this hook) parse with the
+  // right frontmatter rule for the file on screen.
+  useEffect(() => {
+    setLinkedDocParsePath(linkedDocHook.filepath ?? null);
+  }, [linkedDocHook.filepath]);
+
   // Active document's directory — feeds both click-time popout fetches and
   // the validator hook so they resolve against the same base. Drifting
   // these would silently re-introduce the demote-correct-link bug.
@@ -816,6 +865,64 @@ const App: React.FC = () => {
     () => !!projectRoot || isFileBrowserEnabled() || isVaultBrowserEnabled(),
     [projectRoot, uiPrefs]
   );
+
+  const canHandleAnnotateSidebarShortcut = useCallback((event: KeyboardEvent) => {
+    if (!annotateMode || archive.archiveMode || goalSetupMode) return false;
+    if (event.defaultPrevented) return false;
+    if (document.querySelector('[data-plannotator-confirm-dialog="true"]')) return false;
+    if (showExport || showImport || showFeedbackPrompt || showClaudeCodeWarning ||
+        showSourceFileEditWarning ||
+        showExitWarning || showAgentWarning || showPermissionModeSetup || pendingPasteImage) return false;
+    if (submitted || isSubmitting || isExiting || isEditingMarkdown) return false;
+
+    const target = event.target as HTMLElement | null;
+    const tag = target?.tagName;
+    return tag !== 'INPUT' && tag !== 'TEXTAREA' && !target?.isContentEditable;
+  }, [
+    annotateMode,
+    archive.archiveMode,
+    goalSetupMode,
+    showExport,
+    showImport,
+    showFeedbackPrompt,
+    showClaudeCodeWarning,
+    showSourceFileEditWarning,
+    showExitWarning,
+    showAgentWarning,
+    showPermissionModeSetup,
+    pendingPasteImage,
+    submitted,
+    isSubmitting,
+    isExiting,
+    isEditingMarkdown,
+  ]);
+
+  useAnnotateSidebarShortcuts({
+    handlers: {
+      toggleContents: {
+        when: canHandleAnnotateSidebarShortcut,
+        handle: () => toggleSidebarTab('toc'),
+      },
+      toggleFiles: {
+        when: (event) => canHandleAnnotateSidebarShortcut(event) && showFilesTab && !archive.archiveMode,
+        handle: () => toggleSidebarTab('files'),
+      },
+    },
+  });
+
+  useDoubleTapShortcuts({
+    scope: annotateSidebarShortcuts,
+    handlers: {
+      toggleAgentTui: {
+        when: (event) =>
+          canHandleAnnotateSidebarShortcut(event) &&
+          annotateSource !== 'message' &&
+          agentTerminalCapability !== null,
+        handle: () => toggleAgentTerminal(),
+      },
+    },
+  });
+
   const fileBrowserDirs = useMemo(() => {
     const projectDirs = projectRoot ? [projectRoot] : [];
     const userDirs = isFileBrowserEnabled()
@@ -903,7 +1010,9 @@ const App: React.FC = () => {
       for (const [filepath, doc] of state.linkedDocSession.docs) {
         linkedDocs.set(filepath, {
           ...doc,
-          blocks: doc.markdown ? parseMarkdownToBlocks(doc.markdown) : undefined,
+          blocks: doc.markdown
+            ? parseMarkdownToBlocks(doc.markdown, { frontmatter: shouldStripFrontmatter(filepath) })
+            : undefined,
         });
       }
       return {
@@ -1007,7 +1116,10 @@ const App: React.FC = () => {
 
     const buildUrl = dirState?.isVault
       ? (path: string) => `/api/reference/obsidian/doc?vaultPath=${encodeURIComponent(dirPath)}&path=${encodeURIComponent(path)}`
-      : (path: string) => `/api/doc?path=${encodeURIComponent(path)}&base=${encodeURIComponent(dirPath)}${convertHtml ? '&convert=1' : ''}`;
+      // `doc=1`: file-browser selections always want annotatable document
+      // rendering — without it, extensions that overlap the code-file set
+      // (.yaml, .json, .toml, …) would come back as code-file popout payloads.
+      : (path: string) => `/api/doc?path=${encodeURIComponent(path)}&base=${encodeURIComponent(dirPath)}&doc=1${convertHtml ? '&convert=1' : ''}`;
     linkedDocHook.open(absolutePath, buildUrl, 'files');
     fileBrowser.setActiveFile(absolutePath);
   }, [editableDocuments, linkedDocHook, fileBrowser, convertHtml, isEditingMarkdown]);
@@ -1238,7 +1350,10 @@ const App: React.FC = () => {
       const enriched: Map<string, LinkedDocAnnotationEntry> = new Map(docAnnotations);
       for (const [filepath, entry] of enriched) {
         if (entry.markdown) {
-          enriched.set(filepath, { ...entry, blocks: parseMarkdownToBlocks(entry.markdown) });
+          enriched.set(filepath, {
+            ...entry,
+            blocks: parseMarkdownToBlocks(entry.markdown, { frontmatter: shouldStripFrontmatter(filepath) }),
+          });
         }
       }
       output += exportLinkedDocAnnotations(enriched);
@@ -1454,7 +1569,9 @@ const App: React.FC = () => {
   // which isn't in state yet when the remap runs.
   const applyEditedDocument = useCallback((next: string, list?: Annotation[]): Annotation[] => {
     const sourceAnnotations = list ?? annotationsRef.current;
-    const newBlocks = parseMarkdownToBlocks(next);
+    // Match the display parse (blocks memo) — the active document's
+    // frontmatter rule must apply here too or the remapped blockIds drift.
+    const newBlocks = parseMarkdownToBlocks(next, { frontmatter: parseFrontmatterRef.current });
     const remapped = sourceAnnotations.map((a) => {
       if (a.diffContext || a.type === AnnotationType.GLOBAL_COMMENT || a.id.startsWith('ann-checkbox-')) return a;
       const blk = newBlocks.find((b) => b.content.includes(a.originalText));
@@ -2134,7 +2251,7 @@ const App: React.FC = () => {
         if (!res.ok) throw new Error('Not in API mode');
         return res.json();
       })
-      .then((data: { plan: string; origin?: Origin; mode?: 'annotate' | 'annotate-last' | 'annotate-folder' | 'archive' | 'goal-setup'; goalSetup?: GoalSetupBundle; filePath?: string; sourceInfo?: string; sourceConverted?: boolean; sourceSave?: SourceSaveCapability; gate?: boolean; renderAs?: 'html' | 'markdown'; rawHtml?: string; shareHtml?: string; convertHtml?: boolean; sharingEnabled?: boolean; shareBaseUrl?: string; pasteApiUrl?: string; repoInfo?: { display: string; branch?: string; host?: string }; previousPlan?: string | null; versionInfo?: { version: number; totalVersions: number; project: string }; archivePlans?: ArchivedPlan[]; projectRoot?: string; isWSL?: boolean; serverConfig?: { displayName?: string; gitUser?: string }; recentMessages?: PickerMessage[]; agentTerminal?: AgentTerminalCapability }) => {
+      .then((data: { plan: string; origin?: Origin; mode?: 'annotate' | 'annotate-last' | 'annotate-folder' | 'archive' | 'goal-setup'; goalSetup?: GoalSetupBundle; filePath?: string; sourceInfo?: string; sourceConverted?: boolean; sourceSave?: SourceSaveCapability; gate?: boolean; renderAs?: 'html' | 'markdown'; rawHtml?: string; shareHtml?: string; diffHtml?: string; convertHtml?: boolean; sharingEnabled?: boolean; shareBaseUrl?: string; pasteApiUrl?: string; repoInfo?: { display: string; branch?: string; host?: string }; previousPlan?: string | null; versionInfo?: { version: number; totalVersions: number; project: string }; archivePlans?: ArchivedPlan[]; projectRoot?: string; isWSL?: boolean; serverConfig?: { displayName?: string; gitUser?: string }; recentMessages?: PickerMessage[]; agentTerminal?: AgentTerminalCapability }) => {
         // Initialize config store with server-provided values (config file > cookie > default)
         configStore.init(data.serverConfig);
         // Session-level force-markdown preference (--markdown); threaded into folder/linked
@@ -2158,6 +2275,7 @@ const App: React.FC = () => {
           setRenderAs('html');
           setRawHtml(data.rawHtml);
           setShareHtml(data.shareHtml ?? '');
+          setHtmlDiffHtml(data.diffHtml ?? null);
           setMarkdown('');
         } else if (data.mode === 'annotate-folder') {
           // Folder annotation mode: clear demo content, let user pick a file
@@ -3864,7 +3982,7 @@ const App: React.FC = () => {
         )}
 
         {/* Main Content */}
-        <ScrollViewportContext.Provider value={scrollViewport}>
+        <ScrollViewportProvider viewport={scrollViewport}>
         <div data-print-region="content" className={`flex-1 flex overflow-hidden relative z-0 ${isResizing ? 'select-none' : ''}`}>
           {/* Tater sprites — inside content wrapper so z-0 stacking context applies */}
           {taterMode && <TaterSpriteRunning />}
@@ -3891,6 +4009,8 @@ const App: React.FC = () => {
                   {...agentTerminalResize.handleProps}
                   className="hidden lg:block z-[55]"
                   side="left"
+                  hideHoverTrack
+                  tooltip={RESIZE_HANDLE_TOOLTIP}
                   onCollapse={hideAgentTerminal}
                 />
               )}
@@ -3902,7 +4022,7 @@ const App: React.FC = () => {
               activeTab={sidebar.activeTab}
               onToggleTab={toggleSidebarTab}
               hasDiff={planDiff.hasPreviousVersion}
-              showVersionsTab={versionInfo !== null && versionInfo.totalVersions > 1}
+              showVersionsTab={!isHtmlSurface && versionInfo !== null && versionInfo.totalVersions > 1}
               showFilesTab={showFilesTab && !archive.archiveMode}
               showMessagesTab={annotateSource === 'message' && recentMessages.length > 1}
               showAgentTerminalTab={showAgentTerminalControls}
@@ -3949,7 +4069,11 @@ const App: React.FC = () => {
                     toast('Finish editing first', { description: 'Use "Done editing" before opening files.' });
                     return;
                   }
-                  if (isEditingMarkdown && !/\.(mdx?|txt)$/i.test(args[0])) {
+                  // Mid-edit, only files that can themselves be edited (source-save
+                  // capable: .md/.mdx/.txt) may be opened. Wider annotatable types
+                  // (.yaml/.json/…) are view-only — switching to one mid-edit would
+                  // silently downgrade "Done editing" to feedback-only edits.
+                  if (isEditingMarkdown && !isSourceSaveFilePath(args[0])) {
                     toast('Finish editing first', { description: 'Use "Done editing" before opening non-editable files.' });
                     return;
                   }
@@ -3958,7 +4082,7 @@ const App: React.FC = () => {
                 onFilesFetchAll={() => fileBrowser.fetchAll(fileBrowserDirs)}
                 onFilesRetryVaultDir={(vaultPath) => fileBrowser.addVaultDir(vaultPath)}
                 hasFileAnnotations={hasFileAnnotations}
-                showVersionsTab={versionInfo !== null && versionInfo.totalVersions > 1}
+                showVersionsTab={!isHtmlSurface && versionInfo !== null && versionInfo.totalVersions > 1}
                 versionInfo={versionInfo}
                 versions={planDiff.versions}
                 selectedBaseVersion={planDiff.diffBaseVersion}
@@ -3989,7 +4113,7 @@ const App: React.FC = () => {
                 onSelectMessage={handleSelectMessage}
                 messageAnnotationCounts={activeMessageAnnotationCounts}
               />
-              <ResizeHandle {...tocResize.handleProps} className="hidden lg:block z-[55]" side="left" onCollapse={sidebar.close} />
+              <ResizeHandle {...tocResize.handleProps} className="hidden lg:block z-[55]" side="left" hideHoverTrack tooltip={RESIZE_HANDLE_TOOLTIP} onCollapse={sidebar.close} />
             </div>
           )}
 
@@ -4219,9 +4343,9 @@ const App: React.FC = () => {
                 )}
                 {renderAs === 'html' ? (
                   <HtmlViewer
-                    key={linkedDocHook.isActive ? `doc:${linkedDocHook.filepath}` : 'plan'}
+                    key={(linkedDocHook.isActive ? `doc:${linkedDocHook.filepath}` : 'plan') + (isPlanDiffActive && htmlDiffHtml ? ':diff' : '')}
                     ref={viewerRef}
-                    rawHtml={rawHtml}
+                    rawHtml={isPlanDiffActive && htmlDiffHtml ? htmlDiffHtml : rawHtml}
                     annotations={viewerAnnotations}
                     onAddAnnotation={handleAddAnnotation}
                     onSelectAnnotation={handleSelectAnnotation}
@@ -4234,6 +4358,9 @@ const App: React.FC = () => {
                     maxWidth={isHtmlSurface ? null : annotateReaderMaxWidth}
                     fullViewport={isHtmlSurface}
                     hideControls={htmlToolsHidden}
+                    diffAvailable={!!htmlDiffHtml}
+                    diffActive={isPlanDiffActive && !!htmlDiffHtml}
+                    onToggleDiff={() => setIsPlanDiffActive((v) => !v)}
                     onAskAI={canUseDocumentAskAI ? handleAskAI : undefined}
                   />
                 ) : isEditingMarkdown ? (
@@ -4321,7 +4448,7 @@ const App: React.FC = () => {
               ancestor (`contents` = no layout box). */}
           <div className="contents group/sidebar">
           {/* Resize Handle */}
-          {isPanelOpen && wideModeType === null && !goalSetupMode && (rightSidebarTab === 'annotations' || canUseAskAI) && <ResizeHandle {...panelResize.handleProps} className="hidden md:block z-[55]" side="right" onCollapse={() => setIsPanelOpen(false)} />}
+          {isPanelOpen && wideModeType === null && !goalSetupMode && (rightSidebarTab === 'annotations' || canUseAskAI) && <ResizeHandle {...panelResize.handleProps} className="hidden md:block z-[55]" side="right" hideHoverTrack tooltip={RESIZE_HANDLE_TOOLTIP} onCollapse={() => setIsPanelOpen(false)} />}
 
           {/* Annotation Panel */}
           <AnnotationPanel
@@ -4404,7 +4531,7 @@ const App: React.FC = () => {
           )}
           </div>
         </div>
-        </ScrollViewportContext.Provider>
+        </ScrollViewportProvider>
 
         {/* Code File Popout */}
         {codeFilePopout.popoutProps && (
