@@ -27,6 +27,7 @@ import {
   AGENT_HEARTBEAT_COMMENT,
   AGENT_HEARTBEAT_INTERVAL_MS,
 } from "@plannotator/shared/agent-jobs";
+import { resolveGuideLaunchInstructions } from "@plannotator/shared/guide-instructions-store";
 
 export type { AgentJobInfo, AgentJobEvent, AgentCapabilities } from "@plannotator/shared/agent-jobs";
 
@@ -83,7 +84,12 @@ const SERVER_BUILT_PROVIDERS: ReadonlySet<string> = new Set([
 export interface AgentJobHandlerOptions {
   /** Which server mode this handler is mounted in. */
   mode: "plan" | "review" | "annotate";
-  /** Returns the server's base URL (e.g., "http://localhost:12345"). Late-bound. */
+  /**
+   * Returns the server's base URL for spawned subprocesses (e.g.,
+   * "http://127.0.0.1:12345"). Late-bound. Jobs run on the same machine, so
+   * this must stay loopback-reachable regardless of any advertised-URL host
+   * override.
+   */
   getServerUrl: () => string;
   /** Returns the working directory for spawned processes. */
   getCwd: () => string;
@@ -128,6 +134,10 @@ export interface AgentJobHandlerOptions {
      *  model planned section placement against, not whatever patch is on
      *  screen when the job happens to finish. */
     changedFilesSnapshot?: string[];
+    /** Launch-time review-target snapshot (guide provider only) — stored on
+     *  AgentJobInfo so guide persistence labels the envelope with the context
+     *  the guide was generated against (see AgentJobInfo.guideContext). */
+    guideContext?: AgentJobInfo["guideContext"];
   } | null>;
   /**
    * Called after a job process exits with exit code 0.
@@ -238,7 +248,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
     command: string[],
     label: string,
     outputPath?: string,
-    spawnOptions?: { captureStdout?: boolean; stdinPrompt?: string; cwd?: string; prompt?: string; engine?: string; model?: string; effort?: string; reasoningEffort?: string; fastMode?: boolean; thinking?: string; prUrl?: string; diffScope?: string; diffContext?: AgentJobInfo["diffContext"]; reviewProfileId?: string; reviewProfileLabel?: string; changedFilesSnapshot?: string[] },
+    spawnOptions?: { captureStdout?: boolean; stdinPrompt?: string; cwd?: string; prompt?: string; engine?: string; model?: string; effort?: string; reasoningEffort?: string; fastMode?: boolean; thinking?: string; prUrl?: string; diffScope?: string; diffContext?: AgentJobInfo["diffContext"]; reviewProfileId?: string; reviewProfileLabel?: string; changedFilesSnapshot?: string[]; guideContext?: AgentJobInfo["guideContext"] },
   ): AgentJobInfo {
     const source = jobSource(id);
 
@@ -260,6 +270,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
       ...(spawnOptions?.prUrl && { prUrl: spawnOptions.prUrl }),
       ...(spawnOptions?.diffScope && { diffScope: spawnOptions.diffScope }),
       ...(spawnOptions?.diffContext && { diffContext: spawnOptions.diffContext }),
+      ...(spawnOptions?.guideContext && { guideContext: spawnOptions.guideContext }),
       ...(spawnOptions?.reviewProfileId && { reviewProfileId: spawnOptions.reviewProfileId }),
       ...(spawnOptions?.reviewProfileLabel && { reviewProfileLabel: spawnOptions.reviewProfileLabel }),
     };
@@ -604,7 +615,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
           const KNOWN_JOB_FIELDS = new Set([
             "provider", "command", "label",
             "engine", "model", "reasoningEffort", "effort", "thinking", "fastMode",
-            "reviewProfileId", "repairOf",
+            "reviewProfileId", "repairOf", "instructions",
           ]);
           if (body && typeof body === "object") {
             const unknown = Object.keys(body).filter((k) => !KNOWN_JOB_FIELDS.has(k));
@@ -664,6 +675,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
           let jobReviewProfileId: string | undefined;
           let jobReviewProfileLabel: string | undefined;
           let jobChangedFilesSnapshot: string[] | undefined;
+          let jobGuideContext: AgentJobInfo["guideContext"] | undefined;
           const jobId = crypto.randomUUID();
           if (options.buildCommand) {
             // Thread config from POST body to buildCommand
@@ -676,6 +688,13 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
             if (body.fastMode === true) config.fastMode = true;
             if (typeof body.reviewProfileId === "string") config.reviewProfileId = body.reviewProfileId;
             if (typeof body.repairOf === "string") config.repairOf = body.repairOf;
+            // Guide extra instructions (#1265): explicit launch text wins,
+            // else the server-stored standing instructions apply; neither
+            // yields text and launches build the exact same prompts as before.
+            const launchInstructions = provider === "guide"
+              ? resolveGuideLaunchInstructions(body.instructions)
+              : undefined;
+            if (launchInstructions !== undefined) config.instructions = launchInstructions;
             const built = await options.buildCommand(provider, Object.keys(config).length > 0 ? config : undefined);
             if (built) {
               command = built.command;
@@ -697,6 +716,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
               jobReviewProfileId = built.reviewProfileId;
               jobReviewProfileLabel = built.reviewProfileLabel;
               jobChangedFilesSnapshot = built.changedFilesSnapshot;
+              jobGuideContext = built.guideContext;
             }
           }
 
@@ -724,6 +744,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
             reviewProfileId: jobReviewProfileId,
             reviewProfileLabel: jobReviewProfileLabel,
             changedFilesSnapshot: jobChangedFilesSnapshot,
+            guideContext: jobGuideContext,
           });
           return Response.json({ job }, { status: 201 });
         } catch (err) {

@@ -14,7 +14,7 @@ import { OverlayScrollArea } from '@plannotator/ui/components/OverlayScrollArea'
 import { GitHubIcon } from '@plannotator/ui/components/GitHubIcon';
 import { Paperclip } from 'lucide-react';
 
-import { SidebarActionRow, SemanticDiffRow, AllFilesRow } from './PanelNavRows';
+import { SidebarActionRow, SemanticDiffRow, CallFlowRow, AllFilesRow } from './PanelNavRows';
 
 interface FileTreeProps {
   files: DiffFile[];
@@ -81,6 +81,11 @@ interface FileTreeProps {
   onSelectSemanticDiff?: () => void;
   isSemanticDiffActive?: boolean;
   semanticDiffAvailable?: boolean;
+  onSelectCallFlow?: () => void;
+  isCallFlowActive?: boolean;
+  callFlowEnabled?: boolean;
+  callFlowCount?: number;
+  callFlowLoading?: boolean;
   onSelectAllFiles?: () => void;
   isAllFilesActive?: boolean;
   scrollHighlightIndex?: number;
@@ -152,6 +157,11 @@ export const FileTree: React.FC<FileTreeProps> = ({
   onSelectSemanticDiff,
   isSemanticDiffActive = false,
   semanticDiffAvailable = false,
+  onSelectCallFlow,
+  isCallFlowActive = false,
+  callFlowEnabled = false,
+  callFlowCount,
+  callFlowLoading,
   onSelectAllFiles,
   isAllFilesActive = false,
   scrollHighlightIndex,
@@ -178,8 +188,16 @@ export const FileTree: React.FC<FileTreeProps> = ({
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     if (!enableKeyboardNav || e.defaultPrevented) return;
 
-    // Don't interfere with input fields
-    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+    // Don't interfere with input fields. composedPath()[0] pierces shadow DOM
+    // (same guard as AllFilesCodeView): window-level e.target retargets to the
+    // shadow HOST, so keystrokes in the Pierre editor's contenteditable (edit
+    // sessions) would otherwise read as non-editable and Home/End/arrows would
+    // switch files mid-edit.
+    const origin = (e.composedPath?.()[0] ?? e.target) as HTMLElement | null;
+    if (
+      origin &&
+      (origin.tagName === 'INPUT' || origin.tagName === 'TEXTAREA' || origin.isContentEditable)
+    ) {
       return;
     }
 
@@ -541,6 +559,9 @@ export const FileTree: React.FC<FileTreeProps> = ({
               </span>
             </SidebarActionRow>
           )}
+          {callFlowEnabled && onSelectCallFlow && (
+            <CallFlowRow active={isCallFlowActive} onClick={onSelectCallFlow} count={callFlowCount} loading={callFlowLoading} />
+          )}
           {semanticDiffAvailable && onSelectSemanticDiff && (
             <SemanticDiffRow active={isSemanticDiffActive} onClick={onSelectSemanticDiff} />
           )}
@@ -558,7 +579,7 @@ export const FileTree: React.FC<FileTreeProps> = ({
               node={node}
               expandedFolders={expandedFolders}
               onToggleFolder={handleToggleFolder}
-              activeFileIndex={isAllFilesActive || isSemanticDiffActive || isPROverviewActive || isPRArtifactsActive ? -1 : activeFileIndex}
+              activeFileIndex={isAllFilesActive || isSemanticDiffActive || isCallFlowActive || isPROverviewActive || isPRArtifactsActive ? -1 : activeFileIndex}
               scrollHighlightIndex={isAllFilesActive ? scrollHighlightIndex : undefined}
               onSelectFile={onSelectFile}
               onDoubleClickFile={onDoubleClickFile}

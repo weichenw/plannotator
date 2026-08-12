@@ -1,7 +1,7 @@
 /**
  * Plannotator CLI for Claude Code, Droid, Codex, Gemini CLI, and Copilot CLI
  *
- * Supports twelve modes:
+ * Supports thirteen modes:
  *
  * 1. Plan Review (default, no args):
  *    - Spawned by Claude/Gemini/Codex hook entrypoints
@@ -57,6 +57,10 @@
  *    - Reads improvement hook file from ~/.plannotator/hooks/
  *    - Returns additionalContext or silently passes through
  *
+ * 13. Uninstall (`plannotator uninstall`):
+ *    - Removes recognized installer-owned components across supported hosts
+ *    - Preserves local data by default; `--purge` removes known local data
+ *
  * Global flags:
  *   --help             - Show top-level usage information
  *   --version, -v      - Print version and exit
@@ -78,27 +82,30 @@ import {
 import {
   startAnnotateServer,
   handleAnnotateServerReady,
+  isRemoteSession,
 } from "@plannotator/server/annotate";
 import {
   startGoalSetupServer,
   handleGoalSetupServerReady,
 } from "@plannotator/server/goal-setup";
 import { type DiffType, detectManagedVcs, prepareLocalReviewDiff, gitRuntime } from "@plannotator/server/vcs";
-import { loadConfig, resolveDefaultDiffType, resolveUseJina, resolveSharingEnabled } from "@plannotator/shared/config";
+import { loadConfig, resolveDefaultDiffType, resolveSharingEnabled } from "@plannotator/shared/config";
 import { parseReviewArgs } from "@plannotator/shared/review-args";
 import {
   normalizeGoalSetupBundle,
   type GoalSetupStage,
 } from "@plannotator/shared/goal-setup";
-import { stripAtPrefix, resolveAtReference } from "@plannotator/shared/at-reference";
-import { htmlToMarkdown } from "@plannotator/shared/html-to-markdown";
-import { urlToMarkdown, isConvertedSource } from "@plannotator/shared/url-to-markdown";
+import {
+  buildAmbiguousAnnotateArgsMessage,
+  buildUnresolvedAnnotateArgsMessage,
+  probeAnnotateToken,
+  selectAnnotateTokenTarget,
+} from "@plannotator/shared/annotate-target";
 import { createWorktreePool, type WorktreePool, type PoolEntry } from "@plannotator/shared/worktree-pool";
 import { parsePRUrl, checkPRAuth, fetchPR, getCliName, getCliInstallUrl, getMRLabel, getMRNumberLabel, getDisplayRepo } from "@plannotator/server/pr";
 import { writeRemoteShareLink } from "@plannotator/server/share-url";
-import { resolveMarkdownFile, resolveUserPath, hasMarkdownFiles, ANNOTATABLE_DOC_REGEX, ANNOTATABLE_EXTENSIONS_HINT, MAX_ANNOTATABLE_FILE_BYTES } from "@plannotator/shared/resolve-file";
-import { FILE_BROWSER_EXCLUDED } from "@plannotator/shared/reference-common";
-import { statSync, rmSync, realpathSync, existsSync } from "fs";
+import { resolveAnnotateTarget } from "./annotate-resolution";
+import { rmSync, realpathSync, existsSync } from "fs";
 import { parseRemoteUrl } from "@plannotator/shared/repo";
 import {
   getReviewApprovedPrompt,
@@ -111,6 +118,13 @@ import { registerSession, unregisterSession, listSessions } from "@plannotator/s
 import { openBrowser } from "@plannotator/server/browser";
 import { inlineHtmlLocalAssets } from "@plannotator/server/html-assets";
 import { installAgentTerminalRuntime } from "@plannotator/server/agent-terminal-runtime";
+import { installCallFlowRuntime } from "@plannotator/shared/call-flow";
+import {
+  createDefaultUninstallEnvironment,
+  formatPurgeWarning,
+  formatUninstallResult,
+  runPlannotatorUninstall,
+} from "@plannotator/server/uninstall";
 import { detectProjectName } from "@plannotator/server/project";
 import { hostnameOrFallback } from "@plannotator/shared/project";
 import { readImprovementHook } from "@plannotator/shared/improvement-hooks";
@@ -132,7 +146,7 @@ import {
   type RenderedMessage,
 } from "./session-log";
 import { findCodexRolloutByThreadId, getLatestCodexPlan, getRecentCodexMessages } from "./codex-session";
-import { findCopilotPlanContent, findCopilotSessionForCwd, getRecentCopilotMessages } from "./copilot-session";
+import { findCopilotPlanContent, findCopilotSessionByAncestorPids, findCopilotSessionForCwd, getRecentCopilotMessages } from "./copilot-session";
 import {
   formatInteractiveNoArgClarification,
   formatSubcommandHelp,
@@ -142,10 +156,27 @@ import {
   isSubcommandHelpInvocation,
   isTopLevelHelpInvocation,
   isVersionInvocation,
+  parseStrictAnnotateOptions,
+  isUninstallConfirmationAccepted,
+  parseUninstallOptions,
 } from "./cli";
+import { completeAnnotateCommand } from "./annotate-command";
+import {
+  annotateStartupFailureExitCode,
+  isStrictAnnotateInvocation,
+  assertResultPathAvailable,
+  resolveResultFilePath,
+  STRICT_GATE_ERROR_EXIT_CODE,
+} from "./strict-annotate-result";
 import path from "path";
 import { tmpdir } from "os";
+import { createInterface } from "node:readline/promises";
 import { buildLocalWorkspaceReview, type WorkspaceDiffType } from "@plannotator/server/review-workspace";
+import {
+  createAnnotateOutcomeEmitter,
+  supportsAnnotateApprovalNotes,
+  supportsAnnotateClientLease,
+} from "./annotate-output";
 
 // Embed the built HTML at compile time
 // @ts-ignore - Bun import attribute for text
@@ -157,7 +188,26 @@ import reviewHtml from "../dist/review.html" with { type: "text" };
 const reviewHtmlContent = reviewHtml as unknown as string;
 
 // Check for subcommand
-const args = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+let parsedStrictAnnotateOptions;
+try {
+  parsedStrictAnnotateOptions = parseStrictAnnotateOptions(
+    rawArgs,
+  );
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  // Usage error: the gate was misconfigured, not a reviewer decision.
+  process.exit(STRICT_GATE_ERROR_EXIT_CODE);
+}
+const args = parsedStrictAnnotateOptions.remainingArgs;
+const requireApprovalFlag =
+  parsedStrictAnnotateOptions.requireApproval;
+const resultFile = parsedStrictAnnotateOptions.resultFile
+  ? resolveResultFilePath(
+      parsedStrictAnnotateOptions.resultFile,
+      process.env.PLANNOTATOR_CWD || process.cwd(),
+    )
+  : undefined;
 
 // Global flag: --browser <name>
 const browserIdx = args.indexOf("--browser");
@@ -186,7 +236,8 @@ const hookFlag = hookIdx !== -1;
 if (hookFlag) args.splice(hookIdx, 1);
 if (hookFlag) gateFlag = true;
 const renderHtmlIdx = args.indexOf("--render-html");
-if (renderHtmlIdx !== -1) args.splice(renderHtmlIdx, 1);
+const renderHtmlFlag = renderHtmlIdx !== -1;
+if (renderHtmlFlag) args.splice(renderHtmlIdx, 1);
 const renderMarkdownIdx = args.indexOf("--markdown");
 const renderMarkdownFlag = renderMarkdownIdx !== -1;
 if (renderMarkdownFlag) args.splice(renderMarkdownIdx, 1);
@@ -204,42 +255,10 @@ if (renderMarkdownFlag) args.splice(renderMarkdownIdx, 1);
 // Plaintext (default):
 //   Close → empty. Approve → "The user approved." Annotate → feedback.
 //
-// TODO: The plaintext --gate approval sentinel must stay as the exact string
-// "The user approved." because slash command templates (plannotator-annotate.md,
-// plannotator-last.md) instruct the agent to match it literally. Making this
-// configurable requires updating those templates to accept dynamic values or
-// switching gate mode to structured output only.
-const APPROVED_PLAINTEXT_MARKER = "The user approved.";
-
-function emitAnnotateOutcome(result: {
-  feedback: string;
-  exit?: boolean;
-  approved?: boolean;
-}): void {
-  if (hookFlag) {
-    if (result.approved || result.exit) return;
-    if (result.feedback) {
-      console.log(JSON.stringify({ decision: "block", reason: result.feedback }));
-    }
-    return;
-  }
-  if (jsonFlag) {
-    if (result.approved) {
-      console.log(JSON.stringify({ decision: "approved" }));
-    } else if (result.exit) {
-      console.log(JSON.stringify({ decision: "dismissed" }));
-    } else {
-      console.log(JSON.stringify({ decision: "annotated", feedback: result.feedback || "" }));
-    }
-    return;
-  }
-  if (result.exit) return;
-  if (result.approved) {
-    console.log(APPROVED_PLAINTEXT_MARKER);
-    return;
-  }
-  if (result.feedback) console.log(result.feedback);
-}
+const emitAnnotateOutcome = createAnnotateOutcomeEmitter({
+  hook: hookFlag,
+  json: jsonFlag,
+});
 
 async function loadGoalSetupBundle(
   stage: GoalSetupStage,
@@ -272,13 +291,86 @@ if (helpSubcommand) {
   process.exit(0);
 }
 
-if (args[0] === "install-runtime") {
-  const runtime = args[1];
-  if (runtime !== "agent-terminal") {
-    console.error("Usage: plannotator install-runtime agent-terminal");
+if (args[0] === "uninstall") {
+  let options: ReturnType<typeof parseUninstallOptions>;
+  try {
+    options = parseUninstallOptions(rawArgs.slice(1));
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    console.error("Run 'plannotator uninstall --help' for usage.");
     process.exit(1);
   }
-  const result = await installAgentTerminalRuntime();
+
+  const environment = createDefaultUninstallEnvironment();
+
+  if (!options.dryRun && !options.yes) {
+    if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+      console.error(
+        "Uninstall requires confirmation. Re-run with --yes in a non-interactive shell.",
+      );
+      process.exit(1);
+    }
+
+    if (options.purge) {
+      console.error(formatPurgeWarning(environment.dataDir));
+    } else {
+      console.error(
+        `Local Plannotator data in ${environment.dataDir} will be preserved.`,
+      );
+    }
+
+    const prompt = options.purge
+      ? "Type 'purge' to permanently uninstall and delete local data: "
+      : "Remove Plannotator-installed components? [y/N] ";
+    const readline = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    let answer = "";
+    try {
+      answer = await readline.question(prompt);
+    } finally {
+      readline.close();
+    }
+
+    if (!isUninstallConfirmationAccepted(answer, options.purge)) {
+      console.log("Uninstall cancelled.");
+      process.exit(0);
+    }
+  } else if (options.purge && !options.dryRun) {
+    console.error(formatPurgeWarning(environment.dataDir));
+  }
+
+  const result = await runPlannotatorUninstall(
+    {
+      purge: options.purge,
+      dryRun: options.dryRun,
+    },
+    environment,
+  );
+  const formatted = formatUninstallResult(result);
+  if (formatted) console.log(formatted);
+
+  if (options.dryRun) {
+    console.log("Dry run complete; no changes were made.");
+  } else if (options.purge && result.ok) {
+    console.log(`Known local Plannotator data was purged from ${result.dataDir}.`);
+  } else if (!options.purge) {
+    console.log(`Local Plannotator data was preserved in ${result.dataDir}.`);
+  }
+
+  process.exit(result.ok ? 0 : 1);
+}
+
+if (args[0] === "install-runtime") {
+  const runtime = args[1];
+  if (runtime !== "agent-terminal" && runtime !== "call-flow") {
+    console.error("Usage: plannotator install-runtime <agent-terminal|call-flow>");
+    process.exit(1);
+  }
+  const result = runtime === "call-flow"
+    ? await installCallFlowRuntime()
+    : await installAgentTerminalRuntime();
   console.log(result.message);
   process.exit(result.ok ? 0 : 1);
 }
@@ -407,7 +499,10 @@ function emitOpenCodeAnnotateOutcome(result: {
   feedbackScope?: "message" | "messages";
 }): void {
   if (result.approved) {
-    console.log(JSON.stringify({ decision: "approved" }));
+    console.log(JSON.stringify({
+      decision: "approved",
+      ...(result.feedback ? { feedback: result.feedback } : {}),
+    }));
     return;
   }
   if (result.exit) {
@@ -899,136 +994,137 @@ if (args[0] === "sessions") {
   // ANNOTATE MODE
   // ============================================
 
-  const rawFilePath = args[1];
-  if (!rawFilePath) {
-    console.error("Usage: plannotator annotate <file.md | file.txt | file.html | https://... | folder/>  [--markdown] [--no-jina] [--gate] [--json] [--hook]");
-    process.exit(1);
+  // Startup failures below fire after flag parsing, so under a strict flag they
+  // must not exit 1 — that code means "the reviewer requested changes".
+  function exitAnnotateStartupFailure(message: string): never {
+    console.error(message);
+    process.exit(
+      annotateStartupFailureExitCode({
+        requireApproval: requireApprovalFlag,
+        resultFile,
+      }),
+    );
   }
 
-  // Primary resolution strips the `@` reference marker; rawFilePath is
-  // preserved so each branch can fall back to the literal form below
-  // (scoped-package-style names).
-  let filePath = stripAtPrefix(rawFilePath);
+  const rawFilePath = args[1];
+  if (!rawFilePath) {
+    exitAnnotateStartupFailure("Usage: plannotator annotate <file.md | file.txt | file.html | https://... | folder/>  [--markdown] [--no-jina] [--gate] [--json] [--hook] [--require-approval] [--result-file <path>]");
+  }
 
   // Use PLANNOTATOR_CWD if set (original working directory before script cd'd)
   const projectRoot = process.env.PLANNOTATOR_CWD || process.cwd();
 
-  if (process.env.PLANNOTATOR_DEBUG) {
-    console.error(`[DEBUG] Project root: ${projectRoot}`);
-    console.error(`[DEBUG] File path arg: ${filePath}`);
-  }
-
-  let markdown: string;
-  let rawHtml: string | undefined;
-  let absolutePath: string;
-  let folderPath: string | undefined;
-  let annotateMode: "annotate" | "annotate-folder" = "annotate";
-  let sourceInfo: string | undefined;
-  let sourceConverted = false;
-
-  // --- URL annotation ---
-  const isUrl = /^https?:\/\//i.test(filePath);
-
-  if (isUrl) {
-    const useJina = resolveUseJina(cliNoJina, loadConfig());
-    console.error(`Fetching: ${filePath}${useJina ? " (via Jina Reader)" : " (via fetch+Turndown)"}`);
+  if (resultFile) {
     try {
-      const result = await urlToMarkdown(filePath, { useJina });
-      markdown = result.markdown;
-      sourceConverted = isConvertedSource(result.source);
-      if (process.env.PLANNOTATOR_DEBUG) {
-        console.error(`[DEBUG] Fetched via ${result.source} (${markdown.length} chars)`);
-      }
-    } catch (err) {
-      console.error(`Failed to fetch URL: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-    absolutePath = filePath; // Use URL as the "path" for display
-    sourceInfo = filePath;   // Full URL for source attribution
-  } else {
-    // Folder check with literal-@ fallback for scoped-package-style names.
-    const folderCandidate = resolveAtReference(rawFilePath, (c) => {
-      try { return statSync(resolveUserPath(c, projectRoot)).isDirectory(); }
-      catch { return false; }
-    });
-
-    if (folderCandidate !== null) {
-      const resolvedArg = resolveUserPath(folderCandidate, projectRoot);
-      // Folder annotation mode (markdown/plain text/config + HTML files)
-      if (!hasMarkdownFiles(resolvedArg, FILE_BROWSER_EXCLUDED, ANNOTATABLE_DOC_REGEX)) {
-        console.error(`No annotatable files (markdown, plain-text, config, or HTML) found in ${resolvedArg}`);
-        process.exit(1);
-      }
-      folderPath = resolvedArg;
-      absolutePath = resolvedArg;
-      markdown = "";
-      annotateMode = "annotate-folder";
-      console.error(`Folder: ${resolvedArg}`);
-    } else {
-      // HTML check with the same literal-@ fallback semantics.
-      const htmlCandidate = resolveAtReference(rawFilePath, (c) => {
-        const abs = resolveUserPath(c, projectRoot);
-        return /\.html?$/i.test(abs) && existsSync(abs);
-      });
-
-      if (htmlCandidate !== null) {
-        const resolvedArg = resolveUserPath(htmlCandidate, projectRoot);
-        const htmlFile = Bun.file(resolvedArg);
-        const html = await htmlFile.text();
-        const renderHtmlForFile = !renderMarkdownFlag;
-        if (renderHtmlForFile) {
-          rawHtml = html;
-          markdown = "";
-        } else {
-          markdown = htmlToMarkdown(html);
-          sourceConverted = true;
-        }
-        absolutePath = resolvedArg;
-        sourceInfo = path.basename(resolvedArg);
-        console.error(`${renderHtmlForFile ? "Raw HTML" : "Converted"}: ${absolutePath}`);
-      } else {
-        // Single markdown/plain-text file annotation mode
-        // Strip-first with literal-@ fallback (scoped-package-style names).
-        let resolved = resolveMarkdownFile(filePath, projectRoot);
-        if (resolved.kind === "not_found" && rawFilePath !== filePath) {
-          resolved = resolveMarkdownFile(rawFilePath, projectRoot);
-        }
-
-        if (resolved.kind === "ambiguous") {
-          console.error(`Ambiguous filename "${resolved.input}" — found ${resolved.matches.length} matches:`);
-          for (const match of resolved.matches) {
-            console.error(`  ${match}`);
-          }
-          process.exit(1);
-        }
-        if (resolved.kind === "not_found") {
-          // Check if file exists but has unsupported type
-          const resolvedPath = resolveUserPath(resolved.input, projectRoot);
-          const fileExists = existsSync(resolvedPath);
-
-          if (fileExists) {
-            const ext = path.extname(resolvedPath).toLowerCase();
-            console.error(
-              `File type not supported: ${ext}\n` +
-              `Supported types: ${ANNOTATABLE_EXTENSIONS_HINT}\n` +
-              `For code review, use: plannotator review [file]`
-            );
-          } else {
-            console.error(`File not found: ${resolved.input}`);
-          }
-          process.exit(1);
-        }
-
-        absolutePath = resolved.path;
-        if (Bun.file(absolutePath).size > MAX_ANNOTATABLE_FILE_BYTES) {
-          console.error(`File too large to annotate (max 2MB): ${absolutePath}`);
-          process.exit(1);
-        }
-        markdown = await Bun.file(absolutePath).text();
-        console.error(`Resolved: ${absolutePath}`);
-      }
+      await assertResultPathAvailable(resultFile);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      // Startup validation error: the gate could not start.
+      process.exit(STRICT_GATE_ERROR_EXIT_CODE);
     }
   }
+
+  // Strict invocations keep the exact legacy contract: args[1] is the target,
+  // a typo'd path stays a startup failure (exit 2), and stdout carries only
+  // the decision record. The tolerant token fallback below never runs. Same
+  // predicate as the exit-code path, so the two cannot drift.
+  const strictAnnotate = isStrictAnnotateInvocation({
+    requireApproval: requireApprovalFlag,
+    resultFile,
+  });
+
+  // Tolerant argument handling (#1182): slash-command hosts forward raw user
+  // words verbatim, so a non-strict invocation with several tokens probes
+  // each one instead of blindly taking args[1]. Exactly one token naming an
+  // existing target proceeds with it; several is an error naming every
+  // candidate (never guess); two or more unresolvable words become a handoff
+  // for the agent reading this output. Single-token invocations run the
+  // unchanged pipeline and keep every legacy error (a lone typo'd path stays
+  // "File not found" with exit 1), and unrecognized dash-prefixed tokens
+  // disable tolerance entirely so a typo'd flag errors the way it always
+  // did instead of being silently skipped.
+  const targetTokens = args.slice(1);
+  const tolerantMultiToken = !strictAnnotate && targetTokens.length > 1;
+  // Bare directory names only count as targets when they are the sole
+  // argument; in multi-token mode a stray word matching a directory (or `.`)
+  // must not hijack the fast path.
+  const annotateProbe = (token: string) =>
+    probeAnnotateToken(token, projectRoot, { bareDirectories: false });
+
+  let resolution: Awaited<ReturnType<typeof resolveAnnotateTarget>> | null =
+    tolerantMultiToken
+      ? null
+      : await resolveAnnotateTarget({
+          rawFilePath,
+          projectRoot,
+          noJina: cliNoJina,
+          renderMarkdown: renderMarkdownFlag,
+        });
+
+  if (tolerantMultiToken) {
+    const selection = selectAnnotateTokenTarget(targetTokens, annotateProbe);
+    if (selection.kind === "single") {
+      resolution = await resolveAnnotateTarget({
+        rawFilePath: selection.candidate.value,
+        projectRoot,
+        noJina: cliNoJina,
+        renderMarkdown: renderMarkdownFlag,
+      });
+    } else if (selection.kind === "multiple") {
+      exitAnnotateStartupFailure(buildAmbiguousAnnotateArgsMessage(selection.candidates));
+    } else if (selection.kind === "none" && selection.words.length > 1) {
+      // Content flags only: transport flags (--gate/--json/--hook) describe
+      // this invocation's plumbing, and suggesting them would tell an agent
+      // to start a blocking interactive gate from a plain re-run.
+      const handoffFlags = [
+        ...(renderMarkdownFlag ? ["--markdown"] : []),
+        ...(cliNoJina ? ["--no-jina"] : []),
+        ...(renderHtmlFlag ? ["--render-html"] : []),
+      ];
+      const message = buildUnresolvedAnnotateArgsMessage({
+        words: selection.words,
+        flags: handoffFlags,
+        agentHandoff: true,
+      });
+      if (jsonFlag || hookFlag) {
+        // Machine-readable stdout stays reserved for decision records; the
+        // droid wrapper forwards stderr on failure.
+        exitAnnotateStartupFailure(message);
+      }
+      // Plain mode: a non-zero exit from Claude Code's bash-substitution
+      // skill prefix aborts the prompt before the model runs, so the handoff
+      // must land on stdout with exit 0 to reach the agent at all.
+      console.log(message);
+      process.exit(0);
+    }
+    // "flagged" (unrecognized dash tokens) or a single unresolvable word:
+    // fall through to the unchanged pipeline on args[1] so its legacy
+    // failure surfaces verbatim.
+  }
+
+  if (resolution === null) {
+    resolution = await resolveAnnotateTarget({
+      rawFilePath,
+      projectRoot,
+      noJina: cliNoJina,
+      renderMarkdown: renderMarkdownFlag,
+    });
+  }
+
+  if (!resolution.ok) {
+    exitAnnotateStartupFailure(resolution.message);
+  }
+
+  const {
+    markdown,
+    rawHtml,
+    absolutePath,
+    folderPath,
+    annotateMode,
+    sourceInfo,
+    sourceConverted,
+    isUrl,
+  } = resolution;
 
   const annotateProject = (await detectProjectName()) ?? "_unknown";
 
@@ -1045,6 +1141,17 @@ if (args[0] === "sessions") {
     shareBaseUrl,
     pasteApiUrl,
     gate: gateFlag,
+    approvalNotesSupported: supportsAnnotateApprovalNotes({
+      gate: gateFlag,
+      json: jsonFlag,
+      hook: hookFlag,
+    }),
+    clientLeaseSupported: supportsAnnotateClientLease({
+      gate: gateFlag,
+      json: jsonFlag,
+      hook: hookFlag,
+      isRemote: isRemoteSession(),
+    }),
     rawHtml,
     renderHtml: !!rawHtml,
     convertHtml: renderMarkdownFlag,
@@ -1079,18 +1186,14 @@ if (args[0] === "sessions") {
       : `annotate-${isUrl ? hostnameOrFallback(absolutePath) : path.basename(absolutePath)}`,
   });
 
-  // Wait for user feedback
-  const result = await server.waitForDecision();
-
-  // Give browser time to receive response and update UI
-  await Bun.sleep(1500);
-
-  // Cleanup
-  server.stop();
-
-  // Output feedback (captured by slash command)
-  emitAnnotateOutcome(result);
-  process.exit(0);
+  await completeAnnotateCommand({
+    waitForDecision: server.waitForDecision,
+    settleAfterDecision: () => Bun.sleep(1500),
+    stopServer: server.stop,
+    requireApproval: requireApprovalFlag,
+    resultFile,
+    emitLegacyOutcome: emitAnnotateOutcome,
+  });
 
 } else if (args[0] === "annotate-last" || args[0] === "last") {
   // ============================================
@@ -1104,6 +1207,7 @@ if (args[0] === "sessions") {
   const codexThreadId = process.env.CODEX_THREAD_ID;
   const isCodex = !!codexThreadId;
   const isDroid = detectedOrigin === "droid";
+  const isCopilot = detectedOrigin === "copilot-cli";
 
   // Collect up to N recent assistant messages so the user can pick the right
   // one — defaults to the same selection as the legacy "last message"
@@ -1114,6 +1218,18 @@ if (args[0] === "sessions") {
   const RECENT_MESSAGES_LIMIT = 25;
   let lastMessage: RenderedMessage | null = null;
   let recentMessages: RenderedMessage[] = [];
+
+  // Copilot CLI sets no env fingerprint, so detection matches ancestor pids
+  // against session-state inuse locks (spawns ps). Only attempted when no
+  // earlier branch claims the invocation.
+  let copilotLockSessionDir: string | null = null;
+  let copilotSessionDir: string | null = null;
+  if (!stdinFlag && !isCodex && !isDroid) {
+    copilotLockSessionDir = findCopilotSessionByAncestorPids();
+    copilotSessionDir = copilotLockSessionDir ??
+      (isCopilot ? findCopilotSessionForCwd(projectRoot) : null);
+  }
+  const copilotDetected = isCopilot || copilotSessionDir !== null;
 
   if (stdinFlag) {
     const text = (await Bun.stdin.text()).trim();
@@ -1165,6 +1281,20 @@ if (args[0] === "sessions") {
       recentMessages = getRecentRenderedMessages(droidLog, RECENT_MESSAGES_LIMIT);
       lastMessage = recentMessages[0] ?? null;
     }
+  } else if (copilotDetected) {
+    // Copilot path: prefer the session whose inuse lock an ancestor copilot
+    // process holds; with the origin override and no lock match, fall back
+    // to the cwd heuristic.
+    if (process.env.PLANNOTATOR_DEBUG) {
+      console.error(`[DEBUG] Copilot detected, project root: ${projectRoot}`);
+      console.error(`[DEBUG] Copilot ancestor lock session: ${copilotLockSessionDir ?? "(none)"}`);
+      console.error(`[DEBUG] Copilot selected session: ${copilotSessionDir ?? "(none)"}`);
+    }
+    if (copilotSessionDir) {
+      recentMessages = getRecentCopilotMessages(copilotSessionDir, RECENT_MESSAGES_LIMIT)
+        .map((m) => ({ messageId: m.messageId, text: m.text, lineNumbers: [], timestamp: m.timestamp }));
+      lastMessage = recentMessages[0] ?? null;
+    }
   } else {
     // Claude Code path: resolve session log
     //
@@ -1195,7 +1325,12 @@ if (args[0] === "sessions") {
         console.error(`[DEBUG] ${label}: ${paths.length ? paths.join(", ") : "(none)"}`);
       }
       for (const logPath of paths) {
-        const recent = getRecentRenderedMessages(logPath, RECENT_MESSAGES_LIMIT);
+        // Claude Code transcripts are trees: `/rewind` re-parents the next
+        // message rather than truncating, so a file-order read returns
+        // orphaned messages. Follow the id chain instead.
+        const recent = getRecentRenderedMessages(logPath, RECENT_MESSAGES_LIMIT, {
+          activeBranchOnly: true,
+        });
         if (recent.length > 0) {
           recentMessages = recent;
           lastMessage = recent[0];
@@ -1242,12 +1377,23 @@ if (args[0] === "sessions") {
   const server = await startAnnotateServer({
     markdown: annotatedMessage.text,
     filePath: "last-message",
-    origin: detectedOrigin,
+    origin: copilotDetected ? "copilot-cli" : detectedOrigin,
     mode: "annotate-last",
     sharingEnabled,
     shareBaseUrl,
     pasteApiUrl,
     gate: gateFlag,
+    approvalNotesSupported: supportsAnnotateApprovalNotes({
+      gate: gateFlag,
+      json: jsonFlag,
+      hook: hookFlag,
+    }),
+    clientLeaseSupported: supportsAnnotateClientLease({
+      gate: gateFlag,
+      json: jsonFlag,
+      hook: hookFlag,
+      isRemote: isRemoteSession(),
+    }),
     htmlContent: planHtmlContent,
     recentMessages: pickerMessages,
     onReady: async (url, isRemote, port) => {
@@ -1592,6 +1738,22 @@ if (args[0] === "sessions") {
     shareBaseUrl: bridgeShareBaseUrl,
     pasteApiUrl: bridgePasteApiUrl,
     gate: input.gate === true,
+    approvalNotesSupported: input.gate === true,
+    // Same predicate as the CLI-flag branches, with this transport's inputs
+    // mapped onto it: `gate` arrives on stdin JSON (cli-bridge.ts forwards
+    // parseAnnotateArgs' `gate`); `json` is unconditionally true because
+    // emitOpenCodeAnnotateOutcome is this branch's only output path and always
+    // writes a structured decision record the bridge parses back; `hook` is
+    // false because no flags are parsed here and no hook decision protocol is
+    // emitted. Without this, `/plannotator-last --gate` under OpenCode hangs on
+    // waitForDecision() forever once every review tab is abandoned — the exact
+    // hang #1143 closed for the other three call sites.
+    clientLeaseSupported: supportsAnnotateClientLease({
+      gate: input.gate === true,
+      json: true,
+      hook: false,
+      isRemote: isRemoteSession(),
+    }),
     htmlContent: planHtmlContent,
     onReady: (url, isRemote, port) => {
       handleAnnotateServerReady(url, isRemote, port);
@@ -1706,10 +1868,17 @@ if (args[0] === "sessions") {
   const projectRoot = process.env.PLANNOTATOR_CWD || process.cwd();
 
   if (process.env.PLANNOTATOR_DEBUG) {
-    console.error(`[DEBUG] Copilot CLI detected, finding session for CWD: ${projectRoot}`);
+    console.error(`[DEBUG] Copilot CLI detected, project root: ${projectRoot}`);
   }
 
-  const sessionDir = findCopilotSessionForCwd(projectRoot);
+  // Prefer the session locked by an ancestor copilot process; the cwd
+  // heuristic can pick a stale session when several exist for one repo.
+  const lockSessionDir = findCopilotSessionByAncestorPids();
+  if (process.env.PLANNOTATOR_DEBUG) {
+    console.error(`[DEBUG] Ancestor lock session: ${lockSessionDir ?? "(none)"}`);
+  }
+
+  const sessionDir = lockSessionDir ?? findCopilotSessionForCwd(projectRoot);
 
   if (!sessionDir) {
     console.error("No Copilot CLI session found.");
@@ -1743,6 +1912,17 @@ if (args[0] === "sessions") {
     sharingEnabled,
     shareBaseUrl,
     gate: gateFlag,
+    approvalNotesSupported: supportsAnnotateApprovalNotes({
+      gate: gateFlag,
+      json: jsonFlag,
+      hook: hookFlag,
+    }),
+    clientLeaseSupported: supportsAnnotateClientLease({
+      gate: gateFlag,
+      json: jsonFlag,
+      hook: hookFlag,
+      isRemote: isRemoteSession(),
+    }),
     htmlContent: planHtmlContent,
     onReady: async (url, isRemote, port) => {
       handleAnnotateServerReady(url, isRemote, port);

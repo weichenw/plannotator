@@ -14,7 +14,7 @@
 
 import type { Origin } from "@plannotator/shared/agents";
 import { resolve } from "path";
-import { isRemoteSession, getServerHostname, startBunServerOnAvailablePort } from "./remote";
+import { isRemoteSession, getServerHostname, startBunServerOnAvailablePort, buildAdvertisedUrl } from "./remote";
 import { openEditorDiff } from "./ide";
 import {
   saveToObsidian,
@@ -41,10 +41,10 @@ import {
 } from "./storage";
 import { getRepoInfo } from "./repo";
 import { detectProjectName } from "./project";
-import { loadConfig, saveConfig, detectGitUser, getServerConfig } from "./config";
+import { loadConfig, saveConfig, detectGitUser, getServerConfig, resolveAIEnabled } from "./config";
 import { readImprovementHook, getImprovementHookExpectedPath } from "@plannotator/shared/improvement-hooks";
 import { composeImproveContext } from "@plannotator/shared/pfm-reminder";
-import { handleImage, handleUpload, handleAgents, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, handleApiNotFound, handleFavicon, handleSaveNotes, readDraftGenerationFromBody, type OpencodeClient } from "./shared-handlers";
+import { handleImage, handleUpload, handleAgents, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, handleApiNotFound, handleFavicon, handleReferenceSkills, handleReferenceSkillContent, handleSaveNotes, readDraftGenerationFromBody, type OpencodeClient } from "./shared-handlers";
 import { contentHash, deleteDraft } from "./draft";
 import { handleDoc, handleDocExists, handleObsidianVaults, handleObsidianFiles, handleObsidianDoc, handleFileBrowserFiles } from "./reference-handlers";
 import { handleFileBrowserFilesStream } from "./reference-watch";
@@ -54,6 +54,7 @@ import { createExternalAnnotationHandler } from "./external-annotations";
 import { isWSL } from "./browser";
 import { AI_QUERY_ENDPOINT, createAIRuntime } from "./ai-runtime";
 import { isAIEndpointPath, type AIEndpoints } from "@plannotator/ai";
+import { isArchiveDocumentMutation } from "@plannotator/shared/archive-mode";
 
 // Re-export utilities
 export { isRemoteSession, getServerPort } from "./remote";
@@ -149,7 +150,7 @@ export async function startPlannotatorServer(
   const draftKey = mode !== "archive" ? contentHash(plan) : "";
   const editorAnnotations = mode !== "archive" ? createEditorAnnotationHandler() : null;
   const externalAnnotations = mode !== "archive" ? createExternalAnnotationHandler("plan") : null;
-  const aiRuntime = mode !== "archive" ? await createAIRuntime() : null;
+  const aiRuntime = mode !== "archive" && resolveAIEnabled() ? await createAIRuntime() : null;
   const slug = mode !== "archive" ? generateSlug(plan) : "";
 
   // Lazy cache for in-session archive browsing (plan review sidebar tab)
@@ -265,6 +266,10 @@ export async function startPlannotatorServer(
             return Response.json({ ok: true });
           }
 
+          if (mode === "archive" && isArchiveDocumentMutation(req.method, url.pathname)) {
+            return Response.json({ error: "Archive is read-only" }, { status: 403 });
+          }
+
           // API: Get plan content
           if (url.pathname === "/api/plan") {
             if (mode === "archive") {
@@ -316,10 +321,11 @@ export async function startPlannotatorServer(
           // API: Update user config (write-back to ~/.plannotator/config.json)
           if (url.pathname === "/api/config" && req.method === "POST") {
             try {
-              const body = (await req.json()) as { displayName?: string; diffOptions?: Record<string, unknown>; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; pfmReminder?: boolean };
+              const body = (await req.json()) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; pfmReminder?: boolean };
               const toSave: Record<string, unknown> = {};
               if (body.displayName !== undefined) toSave.displayName = body.displayName;
               if (body.diffOptions !== undefined) toSave.diffOptions = body.diffOptions;
+              if (body.theme !== undefined) toSave.theme = body.theme;
               if (body.conventionalComments !== undefined) toSave.conventionalComments = body.conventionalComments;
               if (body.conventionalLabels !== undefined) toSave.conventionalLabels = body.conventionalLabels;
               if (body.pfmReminder !== undefined) toSave.pfmReminder = body.pfmReminder;
@@ -368,6 +374,16 @@ export async function startPlannotatorServer(
           // API: Detect Obsidian vaults
           if (url.pathname === "/api/obsidian/vaults") {
             return handleObsidianVaults();
+          }
+
+          // API: Global skill catalog for comment skill references
+          if (url.pathname === "/api/skills" && req.method === "GET") {
+            return handleReferenceSkills();
+          }
+
+          // API: SKILL.md contents for a referenced human-only skill
+          if (url.pathname === "/api/skills/content" && req.method === "GET") {
+            return handleReferenceSkillContent(req);
           }
 
           // API: List Obsidian vault files as a tree
@@ -586,7 +602,7 @@ export async function startPlannotatorServer(
   );
 
   const port = server.port!;
-  const serverUrl = `http://localhost:${port}`;
+  const serverUrl = buildAdvertisedUrl(port);
   let stopPromise: Promise<void> | undefined;
   const stop = () => {
     stopPromise ??= (async () => {

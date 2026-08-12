@@ -16,7 +16,8 @@ plannotator/
 │   │   └── dist/                 # Built single-file apps (index.html, review.html)
 │   ├── opencode-plugin/          # OpenCode plugin
 │   │   ├── commands/             # Slash command stubs (review, annotate, last — plugin intercepts execution)
-│   │   ├── index.ts              # Plugin entry with submit_plan tool + review/annotate event handlers
+│   │   ├── index.ts              # OpenCode 1 entry with submit_plan tool + review/annotate event handlers
+│   │   ├── server.ts             # OpenCode 2 adapter (experimental V2 plugin API)
 │   │   ├── plannotator.html      # Built plan review app
 │   │   └── review-editor.html    # Built code review app
 │   ├── amp-plugin/               # Amp plugin
@@ -132,24 +133,35 @@ claude --plugin-dir ./apps/hook
 | `PLANNOTATOR_REMOTE` | Set to `1` / `true` for remote mode, `0` / `false` for local mode, or leave unset for SSH auto-detection. Uses a fixed port in remote mode; browser-opening behavior depends on the environment. |
 | `PLANNOTATOR_AGENT_TERMINAL_REMOTE` | Set to `1` / `true` to enable the annotate-mode agent terminal while `PLANNOTATOR_REMOTE` is active. Off by default because remote mode binds beyond localhost. |
 | `PLANNOTATOR_PORT` | Fixed port to use. Default: random locally, `19432` for remote sessions. |
+| `PLANNOTATOR_URL_HOST` | Display-only hostname for advertised session URLs (issue #657), e.g. a Tailscale MagicDNS name or tailnet IP, so remote-mode links are reachable from another device instead of `http://localhost:<port>`. Host only — bare hostname, IPv4, or bracketed IPv6 (`[fd7a::1]`); the runtime-chosen port is always appended, and anything carrying a scheme, port, path, credentials, or whitespace warns once on stderr and falls back to `localhost`. Strictly display-only and remote-only: binding stays governed by `PLANNOTATOR_REMOTE`; a local session ignores the override (localhost is advertised and opened, since only loopback is bound) with a once-per-process stderr warning to set `PLANNOTATOR_REMOTE=1`, and spawned agent-review jobs keep a pinned `http://127.0.0.1:<port>` API URL so a tailnet-only hostname cannot break local jobs. Can also be set via `~/.plannotator/config.json` (`{ "urlHost": "host" }`); the env var takes precedence, and an empty-but-set env var (`PLANNOTATOR_URL_HOST=`) suppresses a config-file `urlHost`. Default: unset (`localhost`). |
 | `PLANNOTATOR_BROWSER` | Custom browser to open plans in. macOS: app name or path. Linux/Windows: executable path. |
+| `PLANNOTATOR_AI` | Set to `disabled` to disable Ask AI and the Review Agents / Guided Review execution surfaces, including provider and agent-job endpoints. Persisted guide data is retained and its server APIs remain available, but the in-app history browser is hidden while AI is disabled. External agents can still open reviews and submit annotations. The explicit annotate-mode agent terminal is separate and remains controlled by its own settings. Default: enabled. |
 | `PLANNOTATOR_SHARE` | Set to `disabled` to turn off URL sharing entirely. Default: enabled. Can also be set via `~/.plannotator/config.json` (`{ "share": "disabled" }`); the env var takes precedence. |
 | `PLANNOTATOR_SHARE_URL` | Custom base URL for share links (self-hosted portal). Default: `https://share.plannotator.ai`. |
 | `PLANNOTATOR_PASTE_URL` | Base URL of the paste service API for short URL sharing. Default: `https://plannotator-paste.plannotator.workers.dev`. |
 | `PLANNOTATOR_ORIGIN` | Explicit agent-origin override at the top of the detection chain. Valid values: `claude-code`, `amp`, `droid`, `opencode`, `codex`, `copilot-cli`, `gemini-cli`, `kiro-cli`, `pi`. Invalid values silently fall through to env-based detection. Unset by default. |
 | `PLANNOTATOR_JINA` | Set to `0` / `false` to disable Jina Reader for URL annotation, or `1` / `true` to enable. Default: enabled. Can also be set via `~/.plannotator/config.json` (`{ "jina": false }`) or per-invocation via `--no-jina`. |
-| `PLANNOTATOR_ANNOTATE_HISTORY` | Set to `0` / `false` to disable per-file version history in annotate mode (no copies of annotated files are written to the data dir; the annotate version diff is unavailable). Default: enabled. Can also be set via `~/.plannotator/config.json` (`{ "annotateHistory": false }`); the env var takes precedence. |
+| `PLANNOTATOR_ANNOTATE_HISTORY` | Set to `0` / `false` to disable ALL annotate-session writes to the data dir: per-file version history (no copies of annotated files are written; the annotate version diff is unavailable) AND the durable submitted-feedback records (#678) that single-local-file annotate sessions otherwise write to `history/{project}/{slug}/submissions/` before deleting the draft on submit. Disabling it keeps annotate sessions fully stateless but also gives up that submit crash-recovery record. URL / folder / annotate-last sessions never write either kind of data regardless of this flag. Default: enabled. Can also be set via `~/.plannotator/config.json` (`{ "annotateHistory": false }`); the env var takes precedence. |
+| `PLANNOTATOR_GUIDE_HISTORY` | Set to `0` / `false` to disable persisting successful Guided Reviews (no guide copies are written to the data dir; the "Previous guides" list is then never populated, though already-saved guides remain readable and listed). Default: enabled. Can also be set via `~/.plannotator/config.json` (`{ "guideHistory": false }`); the env var takes precedence. |
 | `PLANNOTATOR_CURSOR_SANDBOX` | Set to `0` / `false` / `disabled` to stop passing `--sandbox enabled` when launching Cursor's `agent` CLI for review jobs — the flag pair is omitted entirely, deferring to the user's own Cursor Agent sandbox configuration. For systems where Cursor's sandbox cannot start (NixOS, AppArmor-restricted Linux). Default: enabled (`--sandbox enabled` is passed). Can also be set via `~/.plannotator/config.json` (`{ "cursorSandbox": false }`); the env var takes precedence. Note: opting out means the review job's write protection relies on `--mode ask` plus the user's own Cursor configuration. |
+| `PLANNOTATOR_TODO_PROVIDER` | Set to `off` / `0` / `false` / `disabled` to stop mirroring the approved plan checklist into an editable todo provider during execution. Default: enabled, which syncs only when a provider is detected (currently pi-todos: detected when its todo directory exists — `<cwd>/.pi/todos` by default, or wherever `PI_TODO_PATH` redirects it when set). The repo-implied `<cwd>/.pi/todos` must realpath to a location inside the project or the provider reads as absent and never writes, so a symlink committed into a hostile repo cannot redirect todo writes out of it; an explicitly set `PI_TODO_PATH` is the user's own choice and is honored verbatim, including outside the project. The mirror is additive — the progress widget is unaffected either way — and sync is one-way, so provider-side edits never feed back into plan execution. Can also be set via `~/.plannotator/config.json` (`{ "todoProvider": "off" }`); the env var takes precedence. |
 | `JINA_API_KEY` | Optional Jina Reader API key for higher rate limits (500 RPM vs 20 RPM unauthenticated). Free keys include 10M tokens. |
 | `PLANNOTATOR_DATA_DIR` | Override the base data directory. Supports `~` expansion. Default: `~/.plannotator`. When unset, an existing `~/.plannotator` always wins; if it doesn't exist and `$XDG_DATA_HOME` is set to an absolute path, `$XDG_DATA_HOME/plannotator` is used; otherwise `~/.plannotator` (the XDG spec's implicit `~/.local/share` default is deliberately not applied). All data (plans, history, drafts, config, hooks, sessions, debug logs, IPC registry) is stored under this directory. |
 | `PLANNOTATOR_FILE_BROWSER_MAX_FILES` | File-discovery limit: regular files inspected by CLI markdown/folder resolution and startup code-file warming, supported files returned by the file browser, and directories scanned during multi-repo workspace discovery (symlinks may point outside the workspace, so the budget — not the root — bounds that walk). Must be a positive integer; invalid, zero, or negative values use the default of `5000`. |
 | `PLANNOTATOR_GLIMPSE` | Set to `0` / `false` to disable the Glimpse native window even when `glimpseui` is installed. Default: enabled. Can also be set via `~/.plannotator/config.json` (`{ "glimpse": false }`). |
 | `PLANNOTATOR_GLIMPSE_WIDTH` | Width in pixels for the Glimpse native window. Default: `1280`. |
 | `PLANNOTATOR_GLIMPSE_HEIGHT` | Height in pixels for the Glimpse native window. Default: `900`. |
-| `PLANNOTATOR_VERIFY_ATTESTATION` | **Read by the install scripts only**, not by the runtime binary. Set to `1` / `true` to have `scripts/install.sh` / `install.ps1` / `install.cmd` run `gh attestation verify` on every install. Off by default. Can also be set persistently via `~/.plannotator/config.json` (`{ "verifyAttestation": true }`) or per-invocation via `--verify-attestation`. Requires `gh` installed and authenticated. |
+| `PLANNOTATOR_VERIFY_ATTESTATION` | **Read by the install scripts only**, not by the runtime binary. Set to `1` / `true` to have `scripts/install.sh` / `install.ps1` / `install.cmd` run `gh attestation verify` on every install. Off by default. Can also be set persistently via `~/.plannotator/config.json` (`{ "verifyAttestation": true }`) or per-invocation via `--verify-attestation`. Requires the `gh` CLI, but not a login: the attestation bundle is fetched from GitHub's public attestations API (single unauthenticated attempt, never retried; the endpoint allows 60 requests/hour per IP) and verified with `--bundle`; the extraction needs one JSON tool on PATH (node, python3, or jq). gh's authenticated fetch is the fallback whenever the bundle path is unavailable or does not complete (missing extractor, fetch failure, or a gh that cannot verify the fetched bundle, e.g. an older gh without `--bundle`). Verification still needs network on every run because the Sigstore TUF trust root is fetched per-run; that failure is reported as connectivity, distinct from a real provenance failure, and both fail closed. |
+| `PLANNOTATOR_SKIP_CODEX_INSTALL` | **Read by the install scripts only.** Set to `1` / `true` to skip writing the Codex integration (`hooks.json` / `config.toml` under `CODEX_HOME`, and the Codex-home stale-skill cleanup) even when Codex is detected. The installer reports the honest state ("Codex: detected, skipped (...)" vs "not detected" vs installed) and never removes an integration a previous install wired. Also settable via `~/.plannotator/config.json` (`{ "skipInstall": { "codex": true } }`); precedence is `--skip-codex` flag > env var > config. Off by default. |
+| `PLANNOTATOR_SKIP_GEMINI_INSTALL` | **Read by the install scripts only.** Same opt-out shape for the Gemini CLI integration (`~/.gemini` policy file, settings hook, slash commands). Config key: `skipInstall.gemini`; flag: `--skip-gemini`. Off by default. |
+| `PLANNOTATOR_SKIP_KIRO_INSTALL` | **Read by the install scripts only.** Same opt-out shape for the Kiro CLI integration (`~/.kiro` skills and agent, including the `~/.kiro` stale-skill sweep). Config key: `skipInstall.kiro`; flag: `--skip-kiro`. Off by default. |
+| `PLANNOTATOR_SKIP_OPENCODE_INSTALL` | **Read by the install scripts only.** Do-not-write switch for the OpenCode integration (command stubs under `~/.config/opencode/commands`, the OpenCode plugin cache clear, and the stale command-stub sweep). OpenCode has no detection leg, so there is no detected/not-detected reporting, just a skip note. Config key: `skipInstall.opencode`; flag: `--skip-opencode`. Off by default. |
+| `PLANNOTATOR_SKIP_SKILLS_INSTALL` | **Read by the install scripts only.** Set to `1` / `true` to skip the skills/slash-command sparse checkout entirely — no `git clone` of the release tag, so nothing is written to any skill or command scope (`~/.claude/skills`, `~/.agents/skills`, the OpenCode command stubs, the Gemini `.toml` commands, `~/.kiro`), the extras are not offered, and the skill-scope cleanup sweeps stay suspended (skip means do-not-write, never remove). The binary, sem sidecar, agent-terminal runtime, hooks, and per-agent config still install, and git stops being a hard requirement. The installer reports `Skills: skipped (...)` and the closing banner stops claiming the `/plannotator-*` commands are ready. Unlike the per-agent opt-outs this is not one agent's home — it covers every scope the checkout writes. Config key: `skipInstall.skills`; flags: `--skip-skills` (bash/cmd), `-SkipSkills` (PowerShell); precedence is flag > env var > config. Used by the `install-script-smoke` CI job, which installs a synthetic `v9.9.9` whose tag has no GitHub counterpart. Off by default. |
 | `PLANNOTATOR_SKIP_AGENT_TERMINAL_INSTALL` | Set to `1` / `true` to skip installing the managed Node/WebTUI runtime used by compiled Bun builds for the annotate-mode agent terminal. Read by `plannotator install-runtime agent-terminal`, which the installers call automatically. |
-| `PLANNOTATOR_MINIMAL` | **Read by the install scripts only**, not by the runtime binary. Set to `1` / `true` / `yes` to have `scripts/install.sh` / `install.ps1` / `install.cmd` install **only** the `plannotator` binary — skipping the sem sidecar, the agent-terminal runtime, and all per-agent skills, hooks, slash commands, and config. Equivalent to the `--minimal` (aliased `--binary-only`) flag; `--no-minimal` overrides it. Off by default. |
+| `PLANNOTATOR_MINIMAL` | **Read by the install scripts only**, not by the runtime binary. Set to `1` / `true` / `yes` to have `scripts/install.sh` / `install.ps1` / `install.cmd` install **only** the `plannotator` binary, skipping the sem sidecar, the agent-terminal runtime, all per-agent skills, hooks, slash commands, and config, and the CallDiff runtime even when its opt-in is set. Equivalent to the `--minimal` (aliased to `--binary-only`) flag; `--no-minimal` overrides it. Off by default. |
 | `PLANNOTATOR_SKIP_SEM_INSTALL` | **Read by the install scripts only.** Set to `1` / `true` to skip installing the optional `sem` semantic-diff sidecar (used by code review). Off by default. |
+| `PLANNOTATOR_INSTALL_CALLDIFF` | **Read by the install scripts only.** Set to `1` / `true` / `yes` to ALSO install the optional pinned, pruned CallDiff core used by code review's Call Flow analysis (about 5 MB on macOS arm64, Node.js 22+). The runtime is strictly opt-in and is NOT installed by default. The normal path is in-app: enable Call flow, then one click installs core plus exactly the language packs required by the current changed files. Later missing languages are installed from the inline skipped-files notice or the panel's Languages list. Equivalent to `--with-call-flow` (PowerShell: `-WithCallFlow`) or `{ "installCallFlow": true }` in `~/.plannotator/config.json`; precedence is flag > env var > config. `--minimal` always excludes it. Off by default. |
+| `PLANNOTATOR_CALLDIFF_PATH` | Development override for a built CallDiff `0.4.1` package root containing `dist/run.js`; the exact pinned Tree-sitter core and any desired optional grammars must already exist under its `node_modules`. Managed language-pack installation is disabled for overrides. Normal installs use the selective managed core and grammar cache under the Plannotator data directory. |
 
 **Config-only settings (`~/.plannotator/config.json`)**: Some settings have no env-var equivalent and are toggled by editing the config file directly:
 
@@ -206,7 +218,7 @@ The default code-review diff is **`since-base`** — a composite of `merge-base(
 
 **Staging display invariant:** `useGitAdd`'s `stagedFiles` is the EFFECTIVE staged set (sections-sidecar snapshot + session stage/unstage overrides) and is the only source any surface may render staging state from. The sidecar entry's `staged` flag is a snapshot — ORing it back in makes files unstaged mid-session render as staged (and inverts the next toggle).
 
-`since-base` is only offered when the base ref actually resolves — on a repo whose trunk isn't discoverable (`trunk`, no `origin/HEAD`) `getGitContext` omits it and the default falls through to `uncommitted`, so committed branch work is never silently hidden. The since-base patch/sections/fingerprint/file-content paths all degrade to `HEAD` together when merge-base fails for a resolvable-but-unrelated base. First-run shows `ReviewSetupDialog` (replaces the removed `DiffTypeSetupDialog`), which resets everyone to Git-status + since-base once and is reopenable from the review header menu. A one-time `GuideIntroDialog` (guided-reviews announcement) precedes it in the dialog chain (guide intro → look-and-feel → review setup); the three never stack.
+`since-base` is only offered when the base ref actually resolves — on a repo whose trunk isn't discoverable (`trunk`, no `origin/HEAD`) `getGitContext` omits it and the default falls through to `uncommitted`, so committed branch work is never silently hidden. The since-base patch/sections/fingerprint/file-content paths all degrade to `HEAD` together when merge-base fails for a resolvable-but-unrelated base. First-run shows `ReviewSetupDialog` (replaces the removed `DiffTypeSetupDialog`), which resets everyone to Git-status + since-base once and is reopenable from the review header menu. The versioned one-time dialog chain is guide intro → look-and-feel → review setup → analysis layers → Edit Mode; none of the dialogs stack.
 
 ### GitButler review invariants
 
@@ -267,6 +279,28 @@ User annotates content, provides feedback
 Send Annotations → feedback sent to agent session
 ```
 
+### Tolerant argument resolution
+
+Slash-command hosts forward raw user words to `plannotator annotate` verbatim (on Claude Code through a bash-substitution prefix that runs before the model sees anything), so non-strict invocations resolve their arguments in three tiers. The shared logic lives in `packages/shared/annotate-target.ts` (vendored to Pi) and is wired into the CLI's annotate branch plus the OpenCode and Pi command parsers:
+
+1. A single-token invocation runs the classic pipeline unchanged: a bare correct path behaves exactly as before, and a lone typo'd path still fails with `File not found` and exit `1`.
+2. With several tokens, each token is probed; exactly one naming an existing file, URL, or folder proceeds with it (`annotate look at notes.md please` opens `notes.md`). Two or more resolving tokens error naming every candidate rather than guessing, which also means `annotate a.md b.md` (previously: silently opened `a.md`, ignoring `b.md`) is now that error. Bare directory names only count as targets when they are the sole argument, so a stray word matching a directory (or `.`) cannot hijack the fast path; unrecognized dash-prefixed tokens disable the tolerance entirely so a typo'd flag (`--no-jna`) errors the way it always did instead of being silently skipped.
+3. When nothing resolves, the CLI emits an agent-addressed handoff that echoes the words tried and asks the reading agent to re-run with a concrete target (content flags such as `--markdown` / `--no-jina` / `--render-html` are echoed for the re-run; transport flags are not). In plain mode the handoff goes to **stdout with exit `0`**, because a non-zero exit from a Claude Code bang-prefix skill aborts the prompt before the model sees any output; with `--json` / `--hook` it goes to stderr with exit `1` so machine-readable stdout stays reserved for decision records. OpenCode and Pi surface the same message as a host notification.
+
+Strict invocations (`--require-approval` / `--result-file`) bypass all three tiers: `args[1]` is the target and a typo'd path stays a startup failure with exit `2`.
+
+The bang prefix in the Claude Code skill is deliberate: #872 (commit `aac5aacb`, "restore `/plannotator-*` bash execution on Claude Code") put it back so the slash command never depends on the model choosing to run the binary. Argument-shape problems belong here in the CLI's resolution, not in the skill templates.
+
+### Strict direct annotate results
+
+Direct `plannotator annotate` invocations may add `--require-approval` and/or `--result-file <path>` only with `--gate --json`; both reject `--hook` and are not shared with OpenCode/Pi slash-command parsing. When neither strict option is present, single-target invocations keep the legacy plaintext, JSON, hook, and exit behavior unchanged; multi-token invocations go through the tolerant tiers described under "Tolerant argument resolution" above.
+
+Strict decisions use one newline-terminated JSON record on stdout and, when requested, identical bytes in the result file. Exit codes follow the grep convention: approval exits `0`; with `--require-approval`, annotated and dismissed decisions are published before exiting `1` (negative human outcome); usage/startup/validation failures — bad flag combinations, strict flags outside `annotate --gate --json`, a missing `--result-file` parent, a pre-existing or dangling-symlink destination, and every annotate startup failure (missing path, unreachable URL, empty folder, ambiguous name, missing file, oversized file) — exit `2` (the gate itself was misconfigured or could not start). Those startup sites exit `1` as before for non-strict invocations, with one deliberate exception: the multi-token zero-resolve handoff is not a startup failure, so in plain non-strict mode it prints on stdout and exits `0` (under `--json`/`--hook` it stays stderr + exit `1`). Under a strict flag `1` is reserved for "the reviewer did not approve", so a typo'd path must never masquerade as a rejection. Post-decision publication failures (destination appears between validation and publish, hard links unavailable) also exit `2`: the result *file* was not published, so they present as environment errors — "the gate could not publish its result" — never as a reviewer outcome, and never as approval (still fail-closed, since only `0` means approved). The stdout decision record is written **before** result-file publication and is still emitted whenever the decision itself completed; only a stdout write failure leaves no record anywhere. Signal deaths keep `128+n`. Result paths resolve from the invocation working directory, require an existing parent and absent destination, and publish via a flushed/closed `0600` same-directory temporary file plus an atomic no-clobber hard link—never copy or overwrite fallback (the `0600` mode is a no-op on Windows, and the atomic link/rename is not followed by a parent-directory fsync, so publication is atomic but not crash-durable). Keep reviewed sources at stable project paths; unique result and diagnostic log files may use a narrow temporary directory. Explicit Close emits `dismissed`; missing results or process/browser failures are recovery cases, never approval.
+
+### Abandoned strict gate sessions
+
+Local direct structured gates (`--gate --json`, not `--hook`, not remote) advertise a client lease in `/api/plan` and serve `/api/annotate/client-lease` (SSE, `ANNOTATE_CLIENT_LEASE_STREAM_PATH`). Each open stream is one connected review surface; the server heartbeats every 5s and, once at least one client has connected, starts a 30s reconnect grace when the last one disconnects. A reconnect inside the grace continues the same review; expiry resolves the gate as the same `dismissed` decision an explicit Close produces, except that it keeps the saved annotation draft so an abandoned review can still be recovered. Approve, feedback, explicit exit, and server stop all cancel a pending expiry. Whichever producer settles the session first wins: every one of them (each connected surface and the expiry itself) goes through a single one-shot settlement, so a decision arriving after the session already resolved is rejected with `409` rather than deleting the draft and reporting success for an outcome the caller never received. Page lifecycle events are deliberately not used: `pagehide`/`beforeunload` also fire on reload and navigation, so they cannot distinguish abandonment from a reconnect. A session that never receives its first client never auto-dismisses, so browser-launch failures still need a caller-side timeout, and remote/shared sessions keep the capability off because tunnel disconnects would read as abandonment.
+
 ## Archive Flow
 
 ```
@@ -274,7 +308,7 @@ User runs plannotator archive (CLI)
         ↓
 Server starts in mode:"archive", reads ~/.plannotator/plans/
         ↓
-Browser opens read-only archive viewer (sharing disabled)
+Browser opens read-only archive viewer
         ↓
 User browses saved plan decisions with approved/denied badges
         ↓
@@ -301,6 +335,8 @@ During normal plan review, an Archive sidebar tab provides the same browsing via
 | `/api/image`          | GET    | Serve image by path query param            |
 | `/api/upload`         | POST   | Upload image, returns `{ path, originalName }` |
 | `/api/obsidian/vaults`| GET    | Detect available Obsidian vaults           |
+| `/api/skills`         | GET    | List global agent skills for comment skill references (`{ skills: [{ name, root, description?, humanOnly, dir }] }`) |
+| `/api/skills/content` | GET    | SKILL.md contents of one discovered skill for human-only feedback injection (`?name=<skill>`) returns `{ skill: { name, dir, path, content, truncated, humanOnly } }`; the name is matched against discovery only, never used as a path |
 | `/api/reference/obsidian/files` | GET | List vault markdown files as nested tree (`?vaultPath=<path>`) |
 | `/api/reference/obsidian/doc`   | GET | Read a vault markdown file (`?vaultPath=<path>&path=<file>`) |
 | `/api/plan/vscode-diff` | POST   | Open diff in VS Code (body: baseVersion)   |
@@ -325,12 +361,16 @@ During normal plan review, an Archive sidebar tab provides the same browsing via
 
 | Endpoint              | Method | Purpose                                    |
 | --------------------- | ------ | ------------------------------------------ |
-| `/api/diff`           | GET    | Returns `{ rawPatch, gitRef, snapshotId, origin, mode?, diffType, base, hideWhitespace, gitContext, agentCwd?, semanticDiff?, sections?, commitInfo?, baseBehindRemote? }`. `snapshotId` identifies this diff snapshot; the client echoes it on `/api/diff/fresh` probes (also returned by the switch/PR endpoints). `sections` is the since-base sidecar (Committed/Changes/Untracked partition); `commitInfo` is the commit-metadata sidecar (subject, markdown body, author + avatar) present only while a `commit:<sha>` diff is active; `baseBehindRemote` flags that the diff base is behind its remote tip. Workspace mode returns `mode: "workspace"` with folder-prefixed paths and no `gitContext`. |
-| `/api/diff/switch`    | POST   | Switch diff type, base branch, or whitespace mode (body: `{ diffType, base?, hideWhitespace?, explicitBase? }` — `diffType` includes the `commit:<sha>` family). `explicitBase: true` marks a base the user picked from the picker — the server then honors it verbatim and permanently disables the bare-local-name → `origin/*` canonicalization for the session (echoed bases stay canonicalizable). Response includes `semanticDiff?`, `sections?`, `commitInfo?`, `baseBehindRemote?`, or `{ superseded: true }` when a newer concurrent switch has taken over (client ignores it). |
+| `/api/diff`           | GET    | Returns `{ rawPatch, gitRef, snapshotId, origin, mode?, diffType, base, hideWhitespace, gitContext, agentCwd?, semanticDiff?, callFlow?, sections?, commitInfo?, baseBehindRemote? }`. `snapshotId` identifies this diff snapshot; the client echoes it on `/api/diff/fresh` probes (also returned by the switch/PR endpoints). `sections` is the since-base sidecar (Committed/Changes/Untracked partition); `commitInfo` is the commit-metadata sidecar (subject, markdown body, author + avatar) present only while a `commit:<sha>` diff is active; `baseBehindRemote` flags that the diff base is behind its remote tip. Workspace mode returns `mode: "workspace"` with folder-prefixed paths and no `gitContext`. |
+| `/api/diff/switch`    | POST   | Switch diff type, base branch, or whitespace mode (body: `{ diffType, base?, hideWhitespace?, explicitBase? }` — `diffType` includes the `commit:<sha>` family). `explicitBase: true` marks a base the user picked from the picker — the server then honors it verbatim and permanently disables the bare-local-name → `origin/*` canonicalization for the session (echoed bases stay canonicalizable). Response includes `semanticDiff?`, `callFlow?`, `sections?`, `commitInfo?`, `baseBehindRemote?`, or `{ superseded: true }` when a newer concurrent switch has taken over (client ignores it). |
 | `/api/commits`        | GET    | One page of the branch's linear `--first-parent` history for the Commits panel (`?limit=&before=`) → `{ commits, hasMore, base }`. Rows carry `isHead` / `isPastBase` (where the branch meets the active base) and best-effort author `avatarUrl`. Plain local git sessions only (PR/workspace/GitButler/jj/p4 → 400); computed against the active diff's cwd, so worktree sessions list the worktree's history. |
 | `/api/diff/fresh`     | GET    | Cheap staleness probe: recomputes the VCS fingerprint captured with the current diff snapshot and returns `{ fresh, fingerprint?, baseBehindRemote?, agentCwd? }`. Accepts `?snapshot=<id>` — the client echoes the `snapshotId` it received with its diff, and a mismatch with the server's current snapshot reports stale PER CLIENT (covers the startup base upgrade and cross-tab switches even when the VCS fingerprint matches). `baseBehindRemote` is carried on every response (omitting it would flicker the "behind GitHub" banner); `agentCwd` re-advertises the PR checkout in PR mode. Unfingerprintable modes (e.g. P4) always report fresh to a matching snapshot. Polled by the UI's "Diff out of date · Refresh" notice. |
 | `/api/fetch-base`     | POST   | Runs `git fetch` for the base's remote tracking ref, then re-queries the remote tip (fresh `ls-remote`) so narrow-refspec fetches report honestly. Backs the "Baseline is behind GitHub · Fetch" banner. Git-only, base-relative diff types only. |
 | `/api/semantic-diff`  | GET    | Runs semantic diff for the active patch and returns parsed sem output or an unavailable/error response (`?fileExt=` / `?fileExts=` optional). |
+| `/api/call-flow`      | GET    | Runs snapshot-bound CallDiff analysis for the active Git review (`?snapshot=<id>` required). Returns bounded call trees, raw output, per-file impacts, and explicit skipped-language/file metadata for packs not yet installed. |
+| `/api/call-flow/install` | POST | Starts or joins the selective install (`{ languageIds?: [...] }`; omission uses the current review's server-authored plan). The coordinator deduplicates/queues core and pack targets, runs Node >= 22 preflight, and enforces the same-origin guard. |
+| `/api/call-flow/install-status` | GET | Poll `{ state, stage?, languageIds?, currentLanguageId?, error?, reason? }` across `downloading` / `verifying` / `installing-deps` / `building`. |
+| `/api/review-analysis` | GET / POST  | GET refreshes capability adverts without mutating settings; POST persists independent `{ semanticDiff, callFlow }` booleans and returns adverts. |
 | `/api/file-content`   | GET    | Returns `{ oldContent, newContent }` for expandable diff context (`?path=&oldPath=&base=`) |
 | `/api/git-add`        | POST   | Stage/unstage a file (body: `{ filePath, undo? }`) |
 | `/api/feedback`       | POST   | Submit review (body: feedback, annotations, agentSwitch) |
@@ -354,9 +394,10 @@ During normal plan review, an Archive sidebar tab provides the same browsing via
 | `/api/agents/review-profiles` | GET | List launchable review profiles (enabled skills + builtin default) |
 | `/api/agents/skills` | GET | List all discovered skills for the add-a-review picker (each flagged `enabled`) |
 | `/api/agents/review-skills` | POST | Enable a skill as a review (body: `{ name }`); writes `review-skills.json` |
+| `/api/agents/guide-instructions` | GET/PUT | Read or replace the Guided Review standing instructions, stored in `${dataDir}/guide-instructions.md` (trimmed, capped; blank PUT deletes). Guide launches whose body carries no `instructions` apply this stored text. |
 | `/api/agents/jobs/stream` | GET | SSE stream for real-time agent job status updates |
 | `/api/agents/jobs` | GET | Snapshot of agent jobs (polling fallback, `?since=N` for version gating) |
-| `/api/agents/jobs` | POST | Launch an agent job (body: `{ provider, command, label, engine?, model?, effort?, reasoningEffort?, thinking?, fastMode?, reviewProfileId?, repairOf? }`) |
+| `/api/agents/jobs` | POST | Launch an agent job (body: `{ provider, command, label, engine?, model?, effort?, reasoningEffort?, thinking?, fastMode?, reviewProfileId?, repairOf?, instructions? }`; `instructions` is guide-only reviewer text appended to the organizer prompt, capped at `GUIDE_EXTRA_INSTRUCTIONS_MAX_CHARS`; when absent, guide launches apply the server-stored standing instructions) |
 | `/api/agents/jobs` | DELETE | Kill all running agent jobs |
 | `/api/agents/jobs/:id` | DELETE | Kill a specific agent job |
 | `/api/pr-diff-scope` | POST | Switch between layer and full-stack diff scope. Response includes `semanticDiff?`. |
@@ -364,8 +405,10 @@ During normal plan review, an Archive sidebar tab provides the same browsing via
 | `/api/pr-switch` | POST | Switch to a different PR in-place (body: `{ url }`). Response includes `semanticDiff?`. |
 | `/api/tour/:jobId` | GET | Fetch Code Tour result (greeting, stops, checklist) for a completed tour job |
 | `/api/tour/:jobId/checklist` | PUT | Persist checklist item state for a Code Tour |
-| `/api/guide/:jobId` | GET | Fetch Guided Review result (ordered sections with overviews + file refs) for a completed guide job |
-| `/api/guide/:jobId/reviewed` | PUT | Persist per-section reviewed state for a guide |
+| `/api/guide/:jobId` | GET | Fetch Guided Review result (ordered sections with overviews + file refs) for a completed guide job, or a persisted guide via the `saved:{id}` pseudo job id |
+| `/api/guide/:jobId/reviewed` | PUT | Persist per-section reviewed state for a guide (live job ids write through to the job's autosaved file; `saved:{id}` ids persist directly) |
+| `/api/guides` | GET | List persisted guides for the current repo: `[{ id, label, title, savedAt, progress: { reviewed, total }, moved }]` — `moved` flags a stored head sha that differs from the head currently under review |
+| `/api/guides/:id` | DELETE | Delete a persisted guide |
 | `/api/guide/:jobId/output` | GET | Fetch a failed guide job's captured raw output for manual repair (404 if none captured) |
 | `/api/guide/:jobId/submit` | POST | Manually submit corrected guide JSON for a failed job (body: `{ payload }`) |
 | `/api/code-nav/resolve` | POST | Search for symbol definitions and references via ripgrep (body: `{ symbol, filePath, line, charStart, side, language? }`) |
@@ -388,7 +431,10 @@ During normal plan review, an Archive sidebar tab provides the same browsing via
 | `/api/upload`         | POST   | Upload image, returns `{ path, originalName }` |
 | `/api/doc`            | GET    | Serve linked .md/.mdx/.html file or code file (`?path=<path>&base=<dir>`) |
 | `/api/doc/exists`     | POST   | Batch-validate code-file paths (body: `{ paths: string[], base?: string }`) |
+| `/api/skills`         | GET    | List global agent skills for comment skill references (`{ skills: [{ name, root, description?, humanOnly, dir }] }`) |
+| `/api/skills/content` | GET    | SKILL.md contents of one discovered skill for human-only feedback injection (`?name=<skill>`) returns `{ skill: { name, dir, path, content, truncated, humanOnly } }`; the name is matched against discovery only, never used as a path |
 | `/api/draft`          | GET/POST/DELETE | Auto-save annotation drafts to survive server crashes |
+| `/api/annotate/client-lease` | GET (SSE) | Client lease for local direct structured gates: each open stream is one connected review surface. 404 when the capability is not advertised. |
 | `/api/agent-terminal/pty/<token>` | WebSocket | Tokenized PTY bridge for the optional annotate-mode agent terminal |
 | `/api/ai/capabilities` | GET | Check if AI features are available |
 | `/api/ai/session` | POST | Create or fork an AI session |
@@ -419,7 +465,7 @@ Every plan is automatically saved to `~/.plannotator/history/{project}/{slug}/` 
 
 This powers the version history API (`/api/plan/version`, `/api/plan/versions`) and the plan diff system.
 
-**Annotate mode** also saves history on open, so the same version diff works when annotating a standalone `.md`/`.txt`/`.html` file (or any other supported plain-text file, e.g. `.yaml`/`.json`/`.toml`). It keys the slug by **file path** — `annotate-{sanitized-basename}-{hash8}` — rather than heading + date, so re-opening the same file groups its versions even as its content (and headings) change. **Note this writes a copy of each annotated file's content** under `~/.plannotator/history/` (or `PLANNOTATOR_DATA_DIR`); disable via `PLANNOTATOR_ANNOTATE_HISTORY=0` or `{ "annotateHistory": false }` in `~/.plannotator/config.json` to keep annotate sessions stateless (the version diff is then unavailable). For `--render-html` files the diff is rendered as the real page with inline `<ins>`/`<del>` highlights via `htmlDiff()` (`packages/shared/html-diff.ts`).
+**Annotate mode** also saves history on open, so the same version diff works when annotating a standalone `.md`/`.txt`/`.html` file (or any other supported plain-text file, e.g. `.yaml`/`.json`/`.toml`). It keys the slug by **file path** — `annotate-{sanitized-basename}-{hash8}` — rather than heading + date, so re-opening the same file groups its versions even as its content (and headings) change. **Note this writes a copy of each annotated file's content** under `~/.plannotator/history/` (or `PLANNOTATOR_DATA_DIR`); disable via `PLANNOTATOR_ANNOTATE_HISTORY=0` or `{ "annotateHistory": false }` in `~/.plannotator/config.json` to keep annotate sessions stateless (the version diff is then unavailable, and the durable submitted-feedback records described in the env-var table are also skipped). Single-local-file annotate sessions additionally write each submitted decision to `history/{project}/{slug}/submissions/{timestamp}.md` BEFORE deleting the annotation draft, so feedback survives an agent-side timeout (#678); a failed record write keeps the draft as the recovery copy. For `--render-html` files the diff is rendered as the real page with inline `<ins>`/`<del>` highlights via `htmlDiff()` (`packages/shared/html-diff.ts`).
 
 History saves independently of the `planSave` user setting (which controls decision snapshots in `~/.plannotator/plans/`). Storage functions live in `packages/shared/storage.ts` (runtime-agnostic, re-exported by `packages/server/storage.ts`). Pi copies the shared files at build time. Slug format: `{sanitized-heading}-YYYY-MM-DD` (heading first for readability).
 
@@ -470,8 +516,23 @@ interface Annotation {
   images?: ImageAttachment[]; // Attached images with names
   source?: string; // External tool identifier (e.g., "eslint") — set when annotation comes from external API
   diffContext?: 'added' | 'removed' | 'modified'; // Set when annotation created in plan diff view
+  htmlAnchor?: HtmlElementAnchor; // Raw-HTML pinpoint: serialized element anchor for reliable restoration
+  htmlAdditionalTargets?: HtmlAnnotationTarget[]; // Raw-HTML shift-click multi-select: extra elements this one comment covers
   startMeta?: { parentTagName; parentIndex; textOffset };
   endMeta?: { parentTagName; parentIndex; textOffset };
+}
+
+interface HtmlElementAnchor {
+  selector: string; // verified-unique CSS selector built in the viewer bridge
+  tagName: string;
+  text?: string; // normalized text snapshot; weak selectors fail closed against it
+  point?: { x: number; y: number }; // normalized (0..1) selected point inside the element's rect, used by placed markers to reproject against the element's current geometry
+}
+
+interface HtmlAnnotationTarget {
+  label?: string; // semantic label from the pinpoint hover cascade (e.g. "Button")
+  text: string; // capped element text, or an element description when text-less
+  anchor?: HtmlElementAnchor; // absent when anchoring failed closed
 }
 
 interface Block {
@@ -510,6 +571,10 @@ interface Block {
 **Redline mode:** User selects text → auto-creates DELETION annotation
 
 Text highlighting uses `web-highlighter` library. Code blocks use manual `<mark>` wrapping (web-highlighter can't select inside `<pre>`).
+
+**Raw-HTML annotate:** the sandboxed viewer never mutates the visited page's DOM. Committed annotations render as numbered placed comment markers plus overlay-projected highlight rectangles inside a shadow-rooted fixed overlay host: the durable anchor data (element selector, text snapshot, normalized selected point) is persisted, and the markers/highlights are disposable projections re-resolved from it on every reconcile. Shift-click multi-select joins additional elements to one comment (`htmlAdditionalTargets`).
+
+Known limitation: printing a raw-HTML annotate session prints highlight stripes from a best-effort absolute-coordinate layer and is degraded inside the iframe (pre-existing); element-only targets (SVG anchors, multi-select additional element targets) have no print representation.
 
 ## Keyboard Shortcuts
 
@@ -567,6 +632,8 @@ type ShareableAnnotation =
 3. Apply `<mark>` highlights
 4. Clear hash from URL (prevents re-parse on refresh)
 
+Known limitation: share links intentionally do not carry HTML element anchors or additional multi-select targets. Restore on the raw-HTML surface is text-search based; this is the contract asserted by `sharing.multiTarget.test.ts`.
+
 ## Settings Persistence
 
 **Location:** `packages/ui/utils/storage.ts`, `planSave.ts`, `agentSwitch.ts`
@@ -575,7 +642,20 @@ Uses cookies (not localStorage) because each hook invocation runs on a random po
 
 ## Syntax Highlighting
 
-Code blocks use bundled `highlight.js`. Language is extracted from fence (```rust) and applied as `language-{lang}`class. Each block highlighted individually via`hljs.highlightElement()`.
+There is **one** highlighter in the app: the Shiki instance `@pierre/diffs` already runs for the code-review diff pane, driven by Shiki's **JavaScript regex engine** (`preferredHighlighter: 'shiki-js'`). `highlight.js` is gone. The wrapper is `packages/ui/utils/codeHighlight.ts`:
+
+- `applyHighlight(el, code, lang, theme)` — imperative drop-in for the old `hljs.highlightElement(el)`. Writes plain text immediately (final size on first paint, no layout shift), then swaps in highlighted markup once the grammar is attached; already-attached grammars highlight synchronously, so there is no flicker on cached highlights. It also enforces that the rendered text is byte-identical to the source and falls back to plain text otherwise, because the annotation layer addresses code blocks by text offset.
+- `highlightToHtml(code, lang, theme)` / `ensureHighlight(lang, theme)` — the sync/async pair behind it, for callers that need HTML strings (the code-file hover preview).
+- `codeBlockClassName(lang)` — the `pn-code font-mono language-{lang}` class every fenced `<code>` carries. **`pn-code` replaced the old `hljs` class** and is the structural hook `blockTargeting`, vim navigation and `print.css` use (`pre > code.pn-code`); `language-*` is how `blockTargeting` reads a block's language back out of the DOM.
+- `onCodeHighlightSwap(listener)` — observes every write `applyHighlight` makes, SYNCHRONOUSLY, immediately after it. Each write replaces the element's children, so it also destroys whatever the annotation layer wrapped inside the fence.
+
+**Code-block annotation marks and highlight swaps.** `web-highlighter` cannot select inside a `<pre>`, so a fenced block is annotated all-or-nothing: one `<mark data-bind-id>` that is the `<code>` element's only child, painted by `paintCodeBlockMark` (`packages/ui/utils/codeBlockMark.ts`) — which MOVES the token spans into the mark rather than flattening them to text, so annotating or re-theming a block never costs it its colours. `Viewer` subscribes to `onCodeHighlightSwap` and re-paints that mark right after any swap, which is what keeps a palette or dark/light change from wiping code-block annotations. Being driven by the swap is also what makes the share/draft restore race safe **by ordering rather than by timing**: a restore that painted before the swap is re-established in the same task the swap ran in, and one that runs after finds the mark already there. Do not "fix" a mark-eating swap by skipping the rewrite when a mark is present — that leaves annotated blocks in stale theme colours.
+
+**Language-less fences render as plain text and are never guessed at (#1212). There is no auto-detection anywhere.** `HighlightedCode` (review suggestions) derives its language from the caller's file path via `detectLanguage`; an unrecognised extension renders plain.
+
+**Theming:** fences resolve the SAME theme the diff pane resolves, via `resolveFenceTheme` / `resolveSyntaxTheme` in `packages/ui/utils/syntaxTheme.ts` (keyed on `(colorTheme, resolvedMode)`; `packages/review-editor/hooks/usePierreTheme.ts` re-exports them). `useFenceTheme()` (`packages/ui/hooks/useFenceTheme.ts`) feeds the components and re-highlights on palette or mode change. Palettes with no Shiki counterpart fall back to `@pierre/diffs`' own `pierre-dark` / `pierre-light`. Consequence: code blocks follow the active palette in both light and dark instead of always rendering github-dark, so **do not add per-theme `.hljs-*`-style token CSS** — pick the right Shiki theme in `SHIKI_THEME_MAP` instead.
+
+**Bundle note:** Pierre imports Shiki's full bundle, so every grammar and theme is already inlined in the single-file builds; reusing its shared highlighter costs no extra bytes and needs no CDN or runtime wasm fetch. The Oniguruma WASM engine is dead weight under `shiki-js` and is aliased to `build/shiki-wasm-stub.ts` in the review, hook and portal Vite configs (via `resolve.alias`, which — unlike `plugins` — is shared with Vite's worker build).
 
 ## Requirements
 

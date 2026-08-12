@@ -66,7 +66,10 @@ interface PanelProps {
   editorAnnotations?: EditorAnnotation[];
   onDeleteEditorAnnotation?: (id: string) => void;
   onClose?: () => void;
-  onQuickCopy?: () => Promise<void>;
+  /** Copy the full feedback payload. May resolve a success boolean; resolving
+    *  `false` suppresses the "Copied" flash. A void resolution (existing hosts)
+    *  is treated as success, preserving the original behavior. */
+  onQuickCopy?: () => Promise<void | boolean>;
   onShare?: () => void;
   otherFileAnnotations?: { count: number; files: number };
   onOtherFileAnnotationsClick?: () => void;
@@ -77,8 +80,11 @@ interface PanelProps {
     *  resolve UI). The panel stays presentation-only; clicks inside the slot
     *  do not select the card. Default: nothing rendered. */
   renderCardFooter?: (annotation: Annotation) => React.ReactNode;
-  /** Hide every mutation affordance (delete/edit buttons on all card kinds).
-    *  Selection and scrolling still work. Default false — today's behavior. */
+  /** Hide every built-in mutation affordance (delete/edit, direct-edit
+    *  discard). The host footer slot still renders: its contents are
+    *  host-owned and may be read affordances (replies, links), so the host
+    *  gates what belongs in it. Selection and scrolling still work.
+    *  Default false — today's behavior. */
   readOnly?: boolean;
 }
 
@@ -178,7 +184,7 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
       <OverlayScrollArea className="flex-1 min-h-0">
         <div ref={listRef} className="p-2 flex flex-col gap-1.5">
         {directEdits?.map((item) => (
-          <DirectEditsCard key={item.id} {...item} />
+          <DirectEditsCard key={item.id} {...item} onDiscard={readOnly ? undefined : item.onDiscard} />
         ))}
         {totalCount === 0 ? (
           (!directEdits || directEdits.length === 0) && (
@@ -249,7 +255,8 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
           {onQuickCopy && (
             <button
               onClick={async () => {
-                await onQuickCopy();
+                const result = await onQuickCopy();
+                if (result === false) return;
                 setCopiedText(true);
                 setTimeout(() => setCopiedText(false), 2000);
               }}

@@ -1,11 +1,197 @@
-import { describe, expect, test, beforeEach, afterAll } from "bun:test";
+import { describe, expect, test, beforeEach, afterAll, spyOn } from "bun:test";
 import {
+  resolveAIEnabled,
   resolveCursorSandbox,
   resolveUseGlimpse,
   resolveAnnotateHistory,
+  resolveGuideHistory,
   resolveUseJina,
+  resolveTodoProviderEnabled,
+  resolveUrlHost,
+  isValidUrlHost,
+  parseReviewAnalysisConfig,
 } from "./config";
 import type { PlannotatorConfig } from "./config";
+
+describe("parseReviewAnalysisConfig", () => {
+  test("accepts independent boolean analysis flags", () => {
+    expect(parseReviewAnalysisConfig({ semanticDiff: false })).toEqual({ semanticDiff: false });
+    expect(parseReviewAnalysisConfig({ callFlow: true })).toEqual({ callFlow: true });
+    expect(parseReviewAnalysisConfig({ semanticDiff: true, callFlow: false })).toEqual({
+      semanticDiff: true,
+      callFlow: false,
+    });
+  });
+
+  test("rejects non-object and non-boolean settings", () => {
+    expect(parseReviewAnalysisConfig(null)).toBeUndefined();
+    expect(parseReviewAnalysisConfig([])).toBeUndefined();
+    expect(parseReviewAnalysisConfig({ semanticDiff: "false" })).toBeUndefined();
+    expect(parseReviewAnalysisConfig({ callFlow: 1 })).toBeUndefined();
+  });
+
+  test("ignores unknown keys instead of persisting them", () => {
+    expect(parseReviewAnalysisConfig({ callFlow: true, futureFlag: true })).toEqual({ callFlow: true });
+  });
+});
+
+describe("resolveAIEnabled", () => {
+  test("defaults to enabled", () => {
+    expect(resolveAIEnabled({})).toBe(true);
+  });
+
+  test("disabled is case-insensitive", () => {
+    expect(resolveAIEnabled({ PLANNOTATOR_AI: "disabled" })).toBe(false);
+    expect(resolveAIEnabled({ PLANNOTATOR_AI: "Disabled" })).toBe(false);
+  });
+
+  test("other values keep AI enabled", () => {
+    expect(resolveAIEnabled({ PLANNOTATOR_AI: "enabled" })).toBe(true);
+    expect(resolveAIEnabled({ PLANNOTATOR_AI: "false" })).toBe(true);
+  });
+});
+
+const TODO_ENV = "PLANNOTATOR_TODO_PROVIDER";
+const originalTodoEnv = process.env[TODO_ENV];
+
+describe("resolveTodoProviderEnabled", () => {
+  beforeEach(() => {
+    delete process.env[TODO_ENV];
+  });
+  afterAll(() => {
+    if (originalTodoEnv === undefined) delete process.env[TODO_ENV];
+    else process.env[TODO_ENV] = originalTodoEnv;
+  });
+
+  test("defaults to enabled", () => {
+    expect(resolveTodoProviderEnabled({})).toBe(true);
+    expect(resolveTodoProviderEnabled({ todoProvider: "auto" })).toBe(true);
+  });
+
+  test("config key can turn the mirror off", () => {
+    expect(resolveTodoProviderEnabled({ todoProvider: "off" })).toBe(false);
+  });
+
+  test("env accepts the same off vocabulary as the other flags", () => {
+    for (const v of ["off", "OFF", "0", "false", "disabled"]) {
+      process.env[TODO_ENV] = v;
+      expect(resolveTodoProviderEnabled({})).toBe(false);
+    }
+  });
+
+  test("other env values keep the mirror on", () => {
+    for (const v of ["auto", "1", "true", "enabled"]) {
+      process.env[TODO_ENV] = v;
+      expect(resolveTodoProviderEnabled({ todoProvider: "off" })).toBe(true);
+    }
+  });
+});
+
+const URL_HOST_ENV = "PLANNOTATOR_URL_HOST";
+const originalUrlHostEnv = process.env[URL_HOST_ENV];
+
+describe("isValidUrlHost", () => {
+  test("accepts bare hostnames, IPv4, and bracketed IPv6", () => {
+    for (const host of [
+      "localhost",
+      "my-machine",
+      "my-machine.tailnet.ts.net",
+      "raspberrypi.local",
+      "100.101.102.103",
+      "[fd7a::1]",
+      "[::1]",
+      "[::ffff:100.101.102.103]",
+    ]) {
+      expect(isValidUrlHost(host)).toBe(true);
+    }
+  });
+
+  test("rejects schemes, paths, ports, credentials, query, fragment, whitespace", () => {
+    for (const host of [
+      "http://my-machine",
+      "https://my-machine.ts.net",
+      "my-machine/path",
+      "my-machine:8080",
+      "user@my-machine",
+      "my-machine?x=1",
+      "my-machine#frag",
+      "my machine",
+      "fd7a::1", // unbracketed IPv6 reads as ":" outside brackets
+      "-leading-hyphen",
+      ".leading.dot",
+      "trailing-hyphen-",
+      "",
+    ]) {
+      expect(isValidUrlHost(host)).toBe(false);
+    }
+  });
+});
+
+describe("resolveUrlHost", () => {
+  beforeEach(() => {
+    delete process.env[URL_HOST_ENV];
+  });
+  afterAll(() => {
+    if (originalUrlHostEnv === undefined) delete process.env[URL_HOST_ENV];
+    else process.env[URL_HOST_ENV] = originalUrlHostEnv;
+  });
+
+  test("defaults to undefined (localhost) with no env var and no config key", () => {
+    expect(resolveUrlHost({})).toBeUndefined();
+  });
+
+  test("config.urlHost is honored when the env var is unset", () => {
+    expect(resolveUrlHost({ urlHost: "my-machine.tailnet.ts.net" })).toBe("my-machine.tailnet.ts.net");
+  });
+
+  test("env wins over the config key", () => {
+    process.env[URL_HOST_ENV] = "env-host";
+    expect(resolveUrlHost({ urlHost: "config-host" })).toBe("env-host");
+  });
+
+  test("an empty (but set) env var suppresses the config key", () => {
+    process.env[URL_HOST_ENV] = "";
+    expect(resolveUrlHost({ urlHost: "config-host" })).toBeUndefined();
+  });
+
+  test("values are trimmed", () => {
+    process.env[URL_HOST_ENV] = "  my-machine  ";
+    expect(resolveUrlHost({})).toBe("my-machine");
+  });
+
+  test("invalid values fall back to undefined (localhost) instead of throwing", () => {
+    for (const v of ["http://my-machine", "my-machine:8080", "a@b", "a b", "host/path"]) {
+      process.env[URL_HOST_ENV] = v;
+      expect(resolveUrlHost({})).toBeUndefined();
+    }
+  });
+
+  test("non-string config values are ignored", () => {
+    expect(resolveUrlHost({ urlHost: 42 as unknown as string })).toBeUndefined();
+    expect(resolveUrlHost({ urlHost: null as unknown as string })).toBeUndefined();
+  });
+
+  test("the invalid-host warning stays a single line for newline-embedded values", () => {
+    // Hosts surface stderr lines like "Plannotator session ready" as clickable
+    // links, so an echoed value must not be able to forge extra lines.
+    const writes: string[] = [];
+    const spy = spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    try {
+      process.env[URL_HOST_ENV] = "bad\nPlannotator session ready:\n  http://evil.example";
+      expect(resolveUrlHost({})).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+    const warning = writes.find((w) => w.includes("invalid advertised URL host"));
+    expect(warning).toBeDefined();
+    // One trailing newline terminates the warning; no interior newlines.
+    expect(warning!.endsWith("\n")).toBe(true);
+    expect(warning!.slice(0, -1)).not.toContain("\n");
+  });
+});
 
 const ENV = "PLANNOTATOR_CURSOR_SANDBOX";
 const originalEnv = process.env[ENV];
@@ -73,6 +259,12 @@ describe("config.json boolean coercion", () => {
       envVar: "PLANNOTATOR_ANNOTATE_HISTORY",
       key: "annotateHistory",
       resolve: resolveAnnotateHistory,
+    },
+    {
+      name: "resolveGuideHistory",
+      envVar: "PLANNOTATOR_GUIDE_HISTORY",
+      key: "guideHistory",
+      resolve: resolveGuideHistory,
     },
     {
       name: "resolveUseJina",

@@ -12,6 +12,69 @@
 import type { DiffLineBgIntensity } from '@plannotator/core/config-types';
 import { storage } from '../utils/storage';
 import { generateIdentity } from '../utils/generateIdentity';
+import {
+  getDefaultThemePair,
+  normalizeThemePair,
+  seedThemePair,
+  type ThemePair,
+} from '../utils/themeRegistry';
+import { parseThemeMode } from '../components/themeModes';
+
+/** Legacy single-palette key, still written so a downgrade renders styled. */
+const COLOR_THEME_COOKIE = 'plannotator-color-theme';
+const MODE_COOKIE = 'plannotator-theme';
+const LIGHT_THEME_COOKIE = 'plannotator-light-theme';
+const DARK_THEME_COOKIE = 'plannotator-dark-theme';
+
+/**
+ * Where a host keeps the two PRE-PAIR values, if not under Plannotator's own
+ * keys. These mirror ThemeProvider's `storageKey` / `colorThemeStorageKey`
+ * props, which existed before the pair and are what a host's already-stored
+ * user preference lives under.
+ *
+ * Only these two legacy keys are overridable. The pair halves are a new
+ * concept with no pre-existing host data, so they always use the fixed
+ * `plannotator-light-theme` / `plannotator-dark-theme` keys; two hosts sharing
+ * one origin with different key prefixes would share those halves.
+ */
+export interface ThemePairLegacyKeys {
+  /** Where the mode is stored (ThemeProvider's `storageKey`). */
+  mode?: string;
+  /** Where the single pre-pair palette is stored (`colorThemeStorageKey`). */
+  colorTheme?: string;
+}
+
+/**
+ * Persist a pair to its cookies without touching the server.
+ *
+ * ThemeProvider calls this once it has resolved a pair, because a pair
+ * migrated from the legacy single-palette key is DERIVED until it is written:
+ * the provider then mirrors the active palette back onto that legacy key, so
+ * leaving the halves underived would lose the migration on the next load.
+ */
+export function writeThemePairCookies(pair: ThemePair, keys?: ThemePairLegacyKeys): void {
+  storage.setItem(keys?.mode ?? MODE_COOKIE, pair.mode);
+  storage.setItem(LIGHT_THEME_COOKIE, pair.light);
+  storage.setItem(DARK_THEME_COOKIE, pair.dark);
+}
+
+/**
+ * Read the persisted pair, seeding either half from the single palette older
+ * releases stored. Returns undefined only when the user has never expressed a
+ * theme preference at all — ThemeProvider reads that as "my props decide".
+ *
+ * `keys` points the two legacy reads at a host's own storage keys so an
+ * upgrade migrates that host's stored preference instead of discarding it.
+ */
+export function readThemePairCookies(keys?: ThemePairLegacyKeys): ThemePair | undefined {
+  const mode = storage.getItem(keys?.mode ?? MODE_COOKIE);
+  const light = storage.getItem(LIGHT_THEME_COOKIE);
+  const dark = storage.getItem(DARK_THEME_COOKIE);
+  const legacy = storage.getItem(keys?.colorTheme ?? COLOR_THEME_COOKIE);
+  if (!mode && !light && !dark && !legacy) return undefined;
+  const seeded = seedThemePair(legacy, parseThemeMode(mode, getDefaultThemePair().mode));
+  return normalizeThemePair({ mode, light: light ?? seeded.light, dark: dark ?? seeded.dark }, seeded);
+}
 
 const DIFF_LINE_BG_INTENSITY_VALUES = ['subtle', 'normal', 'strong'] as const;
 function isDiffLineBgIntensity(v: unknown): v is DiffLineBgIntensity {
@@ -28,6 +91,7 @@ export interface SettingDef<T> {
   toServer?: (value: T) => Record<string, unknown>;
 }
 
+/** Typed registry of persisted UI settings and their storage codecs. */
 export const SETTINGS = {
   displayName: {
     defaultValue: () => generateIdentity(),
@@ -39,6 +103,35 @@ export const SETTINGS = {
     toServer: (v: string) => ({ displayName: v }),
   },
 
+  /**
+   * Appearance: the mode plus the palette assigned to each half of the pair.
+   * Stored as one value because the three fields are only meaningful together —
+   * `mode: system` picks between `light` and `dark` at render time.
+   *
+   * Cookies: `plannotator-theme` (mode) keeps its meaning, joined by
+   * `plannotator-light-theme` / `plannotator-dark-theme`. A user arriving from
+   * an older release has neither half, so the pair is seeded from the single
+   * `plannotator-color-theme` palette they were on (ThemeProvider keeps writing
+   * that key, so a downgrade still finds a palette and never renders unstyled).
+   *
+   * Server: round-trips through `theme` in ~/.plannotator/config.json exactly
+   * like `diffOptions` does, so the choice survives the random port each hook
+   * invocation runs on.
+   */
+  themePair: {
+    defaultValue: () => getDefaultThemePair(),
+    fromCookie: () => readThemePairCookies(),
+    toCookie: (v: ThemePair) => writeThemePairCookies(v),
+    serverKey: 'theme',
+    fromServer: (sc: Record<string, unknown>) => {
+      const theme = sc.theme as Record<string, unknown> | undefined;
+      if (!theme || typeof theme !== 'object') return undefined;
+      if (theme.mode === undefined && theme.light === undefined && theme.dark === undefined) return undefined;
+      return normalizeThemePair(theme, getDefaultThemePair());
+    },
+    toServer: (v: ThemePair) => ({ theme: { mode: v.mode, light: v.light, dark: v.dark } }),
+  },
+
   gridEnabled: {
     // Default ON: plans open in the classic grid / floating-card look. The UI 2.0
     // flat look is offered as an opt-in via the look-and-feel chooser dialog.
@@ -48,6 +141,46 @@ export const SETTINGS = {
       return v === 'true' ? true : v === 'false' ? false : undefined;
     },
     toCookie: (v: boolean) => storage.setItem('plannotator-grid-enabled', String(v)),
+    serverKey: undefined, fromServer: undefined, toServer: undefined,
+  },
+
+  vimModeEnabled: {
+    // Vim bindings deliberately default OFF. Unmodified letter keys must remain
+    // inert for existing users until they explicitly opt into modal document
+    // navigation from Settings > Vim.
+    defaultValue: false as boolean,
+    fromCookie: () => {
+      const value = storage.getItem('plannotator-vim-mode-enabled');
+      return value === 'true' ? true : value === 'false' ? false : undefined;
+    },
+    toCookie: (value: boolean) =>
+      storage.setItem('plannotator-vim-mode-enabled', String(value)),
+    serverKey: undefined, fromServer: undefined, toServer: undefined,
+  },
+
+  vimHudEnabled: {
+    // The larger command HUD is an optional presentation layer on top of Vim
+    // controls. It has no effect while Vim mode itself is disabled.
+    defaultValue: false as boolean,
+    fromCookie: () => {
+      const value = storage.getItem('plannotator-vim-hud-enabled');
+      return value === 'true' ? true : value === 'false' ? false : undefined;
+    },
+    toCookie: (value: boolean) =>
+      storage.setItem('plannotator-vim-hud-enabled', String(value)),
+    serverKey: undefined, fromServer: undefined, toServer: undefined,
+  },
+
+  vimHudKeyPanelEnabled: {
+    // Preserve the existing full HUD for current users while allowing the
+    // bottom-right key panel to be hidden independently from the reticle.
+    defaultValue: true as boolean,
+    fromCookie: () => {
+      const value = storage.getItem('plannotator-vim-hud-key-panel-enabled');
+      return value === 'true' ? true : value === 'false' ? false : undefined;
+    },
+    toCookie: (value: boolean) =>
+      storage.setItem('plannotator-vim-hud-key-panel-enabled', String(value)),
     serverKey: undefined, fromServer: undefined, toServer: undefined,
   },
 
@@ -261,6 +394,55 @@ export const SETTINGS = {
       return isDiffLineBgIntensity(v) ? v : undefined;
     },
     toServer: (v: DiffLineBgIntensity) => ({ diffOptions: { lineBgIntensity: v } }),
+  },
+  /** Experimental: author suggestions by editing code in place in the review
+   *  all-files view. Cookie-only (no server sync) while the feature is
+   *  experimental — default OFF, and when off no edit UI renders and no
+   *  editor is ever constructed. (In code-split hosts the editor chunk is
+   *  never fetched; Plannotator's single-file production build inlines all
+   *  dynamic imports, so there the module namespace exists at page load —
+   *  audited free of top-level side effects — but stays inert.) */
+  editSuggestions: {
+    defaultValue: false as boolean,
+    fromCookie: () => {
+      const v = storage.getItem('plannotator-experimental-edit-suggestions');
+      return v === 'true' ? true : v === 'false' ? false : undefined;
+    },
+    toCookie: (v: boolean) =>
+      storage.setItem('plannotator-experimental-edit-suggestions', String(v)),
+    serverKey: undefined,
+    fromServer: undefined,
+    toServer: undefined,
+  },
+  semanticDiffEnabled: {
+    defaultValue: true as boolean,
+    fromCookie: () => {
+      const value = storage.getItem('plannotator-semantic-diff-enabled');
+      return value === 'true' ? true : value === 'false' ? false : undefined;
+    },
+    toCookie: (value: boolean) =>
+      storage.setItem('plannotator-semantic-diff-enabled', String(value)),
+    serverKey: 'reviewAnalysis',
+    fromServer: (serverConfig: Record<string, unknown>) => {
+      const value = (serverConfig.reviewAnalysis as Record<string, unknown> | undefined)?.semanticDiff;
+      return typeof value === 'boolean' ? value : undefined;
+    },
+    toServer: (value: boolean) => ({ reviewAnalysis: { semanticDiff: value } }),
+  },
+  callFlowEnabled: {
+    defaultValue: false as boolean,
+    fromCookie: () => {
+      const value = storage.getItem('plannotator-call-flow-enabled');
+      return value === 'true' ? true : value === 'false' ? false : undefined;
+    },
+    toCookie: (value: boolean) =>
+      storage.setItem('plannotator-call-flow-enabled', String(value)),
+    serverKey: 'reviewAnalysis',
+    fromServer: (serverConfig: Record<string, unknown>) => {
+      const value = (serverConfig.reviewAnalysis as Record<string, unknown> | undefined)?.callFlow;
+      return typeof value === 'boolean' ? value : undefined;
+    },
+    toServer: (value: boolean) => ({ reviewAnalysis: { callFlow: value } }),
   },
   conventionalComments: {
     defaultValue: false as boolean,
