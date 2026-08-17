@@ -21,7 +21,7 @@ import {
   detectRemoteDefaultInfo,
   getDefaultBranch,
   getFileContentsForDiff,
-  getGitCallFlowMaterializationPatch,
+  getGitSnapshotMaterializationPatch,
   getGitContext,
   getGitDiffFingerprint,
   getWorkingTreeDiffFromBase,
@@ -424,7 +424,7 @@ describe("review-core", () => {
     writeFileSync(join(repoDir, "new-logo.png"), Buffer.from([0, 5, 6, 0, 7]));
 
     const visible = await runGitDiff(runtime, "uncommitted", "main");
-    const materialization = await getGitCallFlowMaterializationPatch(
+    const materialization = await getGitSnapshotMaterializationPatch(
       runtime,
       "uncommitted",
       "main",
@@ -1674,6 +1674,15 @@ describe("review-core", () => {
       path: "/tmp/my-worktree:commit:not-hex",
       subType: "uncommitted",
     });
+  });
+
+  test("rejects a worktree diff type with no path", () => {
+    // An empty path would resolve to an empty cwd; Bun.spawn({ cwd: "" }) runs
+    // git in the server's OWN directory and leaks an unrelated repo's diff.
+    // Every degenerate form must return null so resolveCwd falls back.
+    expect(parseWorktreeDiffType("worktree:")).toBeNull();
+    expect(parseWorktreeDiffType("worktree::uncommitted")).toBeNull();
+    expect(parseWorktreeDiffType("worktree::commit:abc1234")).toBeNull();
   });
 });
 

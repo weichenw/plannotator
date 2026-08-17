@@ -1,16 +1,17 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useState } from 'react';
 import type { CallFlowAdvert, CallFlowInstallStage, CallFlowNode } from '@plannotator/shared/call-flow-types';
 import { getCallFlowLanguage, type CallFlowLanguageId } from '@plannotator/shared/call-flow-languages';
 import type { CallFlowInstallController } from '../../hooks/useCallFlowInstall';
-import { Check, Copy, Info } from 'lucide-react';
+import { Popover } from '@base-ui/react/popover';
+import { Check, Info, Settings2 } from 'lucide-react';
 import { Tooltip } from '@plannotator/ui/components/Tooltip';
-import { copyTextToClipboard } from '@plannotator/ui/utils/clipboard';
 import { useReviewState } from '../ReviewStateContext';
 import {
-  annotationSelectionForCallFlowNode,
   CallFlowTreeView,
   selectionForCallFlowNode,
 } from '../../components/CallFlowTreeView';
+import { CallFlowRawView } from '../../components/CallFlowRawView';
+import { formatCallFlowInstallSize } from '../../utils/callFlowPresentation';
 
 function errorMessage(error: Exclude<import('@plannotator/shared/call-flow-types').CallFlowResponse, { status: 'ok' }> | Error): string {
   return error.message || 'Call-flow analysis failed.';
@@ -27,11 +28,6 @@ function isNodeInstallError(reason: string | undefined): boolean {
   return reason === 'node-unavailable' || reason === 'node-version';
 }
 
-function formatInstallSize(bytes: number): string {
-  const megabytes = Math.ceil(bytes / (1024 * 1024));
-  return `~${megabytes.toLocaleString()} MB`;
-}
-
 function installFailedForLanguage(
   status: CallFlowInstallController['status'],
   languageId: CallFlowLanguageId,
@@ -41,10 +37,103 @@ function installFailedForLanguage(
   return status.languageIds?.includes(languageId) === true;
 }
 
+function installIncludesLanguage(
+  status: CallFlowInstallController['status'],
+  languageId: CallFlowLanguageId,
+): boolean {
+  return status.state === 'running' && status.languageIds.includes(languageId);
+}
+
+function CallFlowLanguagesMenu({
+  languages,
+  installable,
+  install,
+}: {
+  readonly languages: NonNullable<CallFlowAdvert['languages']>;
+  readonly installable: boolean;
+  readonly install: CallFlowInstallController;
+}) {
+  const installed = languages.filter((language) => language.installed);
+  const installedSize = installed.reduce((total, language) => total + language.installSizeBytes, 0);
+  return (
+    <Popover.Root>
+      <Popover.Trigger render={
+        <button
+          type="button"
+          className="call-flow-languages-trigger"
+          aria-label={`Manage Call Flow languages. ${installed.length} of ${languages.length} installed.`}
+          aria-busy={install.status.state === 'running'}
+        />
+      }>
+        <Settings2 aria-hidden="true" size={14} strokeWidth={1.75} />
+        <span>Languages</span>
+        <span className="call-flow-languages-trigger-count">{installed.length}/{languages.length}</span>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Positioner align="end" side="bottom" sideOffset={6} className="z-[110]">
+          <Popover.Popup
+            className="call-flow-languages-popover shadow-lg popover-enter"
+            aria-label="Call Flow language support"
+          >
+            <header className="call-flow-languages-popover-header">
+              <div>
+                <strong>Language support</strong>
+                <span>Install parsers ahead of the next review.</span>
+              </div>
+              <span>{formatCallFlowInstallSize(installedSize)} installed</span>
+            </header>
+            <ul aria-live="polite">
+              {languages.map((language) => {
+                const languageInstallError = installFailedForLanguage(install.status, language.id)
+                  ? install.status
+                  : undefined;
+                const languageInstalling = installIncludesLanguage(install.status, language.id);
+                const requirement = language.required
+                  ? `Needed for ${language.changedFiles} changed ${language.changedFiles === 1 ? 'file' : 'files'}`
+                  : 'Available';
+                return (
+                  <li key={language.id}>
+                    <span>
+                      <strong>{language.label}</strong>
+                      <small>
+                        {language.installed
+                          ? `Installed · ${formatCallFlowInstallSize(language.installSizeBytes)}`
+                          : `${requirement} · ${formatCallFlowInstallSize(language.installSizeBytes)}`}
+                      </small>
+                      {languageInstalling && <small className="call-flow-language-progress">Installing…</small>}
+                      {languageInstallError && (
+                        <small className="call-flow-language-error">Install failed: {languageInstallError.error}</small>
+                      )}
+                    </span>
+                    {!language.installed
+                      && language.kind === 'pack'
+                      && installable
+                      && !languageInstalling
+                      && (
+                      <button
+                        type="button"
+                        onClick={() => install.start([language.id])}
+                        disabled={install.status.state === 'running'}
+                      >
+                        {languageInstallError ? 'Retry' : 'Install'}
+                      </button>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </Popover.Popup>
+        </Popover.Positioner>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}
+
 /**
- * Opt-in install funnel shown only for the runtime-missing flavor of an
+ * Background setup progress shown only for the runtime-missing flavor of an
  * unavailable advert. Never rendered for unsupported views or while the
- * feature is disabled.
+ * feature is disabled. The toggle already captured consent, so the idle state
+ * informs rather than asking for a second confirmation.
  */
 export function CallFlowInstallFunnel({
   advert,
@@ -104,9 +193,15 @@ export function CallFlowInstallFunnel({
               ? 'Install Node.js 22 or newer, make sure it is on PATH, then retry.'
               : 'Nothing was changed. You can retry the install at any time.'}
           </p>
-          <button type="button" className="call-flow-retry" onClick={() => install.start()}>
-            Retry install
-          </button>
+          <div className="call-flow-install-action">
+            <button
+              type="button"
+              className="call-flow-install-cta"
+              onClick={() => install.start(status.languageIds)}
+            >
+              Retry install
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -114,25 +209,23 @@ export function CallFlowInstallFunnel({
   return (
     <div className="call-flow-panel">
       <div className="call-flow-shell call-flow-install call-flow-empty">
-        <span className="call-flow-empty-kicker">Optional runtime not installed</span>
-        <strong>Trace how changed calls reach the rest of the codebase.</strong>
+        <span className="call-flow-empty-kicker">Preparing analysis</span>
+        <strong>Call flow is setting up in the background.</strong>
         <p>
-          Call flow reconstructs the complete inferred entry paths that contain added or
-          removed calls, so a change can be reviewed in the context of everything that
-          reaches it. It runs locally against the review&apos;s exact Git snapshots.
+          You can keep reviewing while Plannotator prepares the local runtime and the
+          language support this review needs.
         </p>
-        {advert.installPlan && (
-          <p className="call-flow-install-disclosure">
-            One-time install: {advert.installPlan.labels.join(', ')} · {formatInstallSize(advert.installPlan.installSizeBytes)} on disk.
-            {' '}Requires Node.js 22 or newer.
-          </p>
-        )}
         {advert.message && advert.reason !== 'runtime-unavailable' && (
           <p className="call-flow-install-detail">{advert.message}</p>
         )}
-        <button type="button" className="call-flow-retry" onClick={() => install.start()}>
-          Install runtime
-        </button>
+        {advert.installPlan && (
+          <p className="call-flow-install-disclosure">
+            Installing <strong>{advert.installPlan.labels.join(', ')}</strong>,{' '}
+            <strong>{formatCallFlowInstallSize(advert.installPlan.installSizeBytes)}</strong> on disk.
+            {' '}Requires Node.js 22 or newer. Other languages install automatically, only
+            when a review needs them.
+          </p>
+        )}
       </div>
     </div>
   );
@@ -142,27 +235,14 @@ export function ReviewCallFlowPanel() {
   const state = useReviewState();
   const analysis = state.callFlowAnalysis;
   const [view, setView] = useState<'paths' | 'raw'>('paths');
-  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle');
-  const copyResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => () => {
-    if (copyResetTimer.current) clearTimeout(copyResetTimer.current);
-  }, []);
 
   const openNode = (node: CallFlowNode) => {
     if (!node.file) return;
     state.openDiffFile(node.file);
     state.onLineSelection(selectionForCallFlowNode(node));
   };
-  const commentOnNode = (node: CallFlowNode) => {
-    if (!node.file) return;
-    const range = annotationSelectionForCallFlowNode(node);
-    if (!range) return;
-    state.onRequestLineAnnotation(node.file, range);
-  };
-
   if (!state.callFlowAdvert.available) {
-    // The runtime-missing flavor of unavailable is the opt-in install funnel.
+    // The runtime-missing flavor of unavailable is the setup progress surface.
     // Unsupported views and the disabled state never offer the install.
     if (state.callFlowAdvert.state === 'unavailable' && state.callFlowAdvert.installable && state.callFlowAdvert.installPlan) {
       return <CallFlowInstallFunnel advert={state.callFlowAdvert} install={state.callFlowInstall} />;
@@ -220,13 +300,11 @@ export function ReviewCallFlowPanel() {
     && data.skippedLanguages.some((language) => installFailedForLanguage(state.callFlowInstall.status, language.id))
       ? state.callFlowInstall.status
       : undefined;
-  const installSkipped = () => state.callFlowInstall.start(data.skippedLanguages.map((language) => language.id));
-  const copyRaw = async () => {
-    const copied = await copyTextToClipboard(data.raw);
-    setCopyState(copied ? 'copied' : 'error');
-    if (copyResetTimer.current) clearTimeout(copyResetTimer.current);
-    copyResetTimer.current = window.setTimeout(() => setCopyState('idle'), 1500);
-  };
+  const skippedLanguageIds = data.skippedLanguages.map((language) => language.id);
+  const skippedInstallRunning = skippedLanguageIds.some((languageId) => (
+    installIncludesLanguage(state.callFlowInstall.status, languageId)
+  ));
+  const retrySkipped = () => state.callFlowInstall.start(skippedLanguageIds);
   return (
     <div className="call-flow-panel">
       <div className="call-flow-shell">
@@ -241,6 +319,13 @@ export function ReviewCallFlowPanel() {
               <button type="button" aria-pressed={view === 'paths'} onClick={() => setView('paths')}>Paths</button>
               <button type="button" aria-pressed={view === 'raw'} onClick={() => setView('raw')}>Raw</button>
             </div>
+            {state.callFlowAdvert.languages && (
+              <CallFlowLanguagesMenu
+                languages={state.callFlowAdvert.languages}
+                installable={state.callFlowAdvert.installable}
+                install={state.callFlowInstall}
+              />
+            )}
             <Tooltip
               content={`Generated by CallDiff ${data.version}. Syntactic analysis of ${data.from} to ${data.to}; not a runtime trace.`}
               side="bottom"
@@ -260,7 +345,7 @@ export function ReviewCallFlowPanel() {
             <span><b className="call-flow-status-added">+</b> added</span>
             <span><b className="call-flow-status-removed">−</b> removed</span>
             <span><b>·</b> unchanged context</span>
-            <span className="call-flow-legend-hint">Open a row or comment on a changed call.</span>
+            <span className="call-flow-legend-hint">Click any row to comment. Shift-click adds steps. Select a file path to open source.</span>
           </div>
         )}
 
@@ -269,34 +354,36 @@ export function ReviewCallFlowPanel() {
             <span>
               {skippedFileCount} {skippedFileCount === 1 ? 'file' : 'files'} skipped:{' '}
               {data.skippedLanguages.map((language) => language.label).join(', ')} support not installed
-              {' '}({formatInstallSize(data.skippedLanguages.reduce((total, language) => total + language.installSizeBytes, 0))}).
+              {' '}({formatCallFlowInstallSize(data.skippedLanguages.reduce((total, language) => total + language.installSizeBytes, 0))}).
+              {skippedInstallRunning && (
+                <small className="call-flow-language-progress">Installing support in the background…</small>
+              )}
               {skippedInstallError && (
                 <small className="call-flow-language-error">Install failed: {skippedInstallError.error}</small>
               )}
+              {!state.callFlowAdvert.installable && (
+                <small className="call-flow-language-progress">
+                  Add this language grammar to PLANNOTATOR_CALLDIFF_PATH to include these files.
+                </small>
+              )}
             </span>
-            {state.callFlowAdvert.installable && (
+            {state.callFlowAdvert.installable && skippedInstallError && (
               <button
                 type="button"
-                onClick={installSkipped}
-                disabled={state.callFlowInstall.status.state === 'running'}
+                onClick={retrySkipped}
               >
-                {state.callFlowInstall.status.state === 'running' ? 'Installing…' : skippedInstallError ? 'Retry' : 'Install'}
+                Retry
               </button>
             )}
           </div>
         )}
 
         {view === 'raw' ? (
-          <section className="call-flow-raw" aria-label="Raw call diff">
-            <div className="call-flow-raw-toolbar">
-              <span>Canonical CallDiff output</span>
-              <button type="button" onClick={() => void copyRaw()} aria-label="Copy raw call diff">
-                {copyState === 'copied' ? <Check aria-hidden="true" size={14} /> : <Copy aria-hidden="true" size={14} />}
-                {copyState === 'copied' ? 'Copied' : copyState === 'error' ? 'Copy failed' : 'Copy'}
-              </button>
-            </div>
-            <pre tabIndex={0}>{data.raw}</pre>
-          </section>
+          <CallFlowRawView
+            sections={[{ key: 'complete', raw: data.raw, rawLineStart: 1 }]}
+            onAnnotateTargets={state.onAddCallFlowAnnotation}
+            findShortcutActive={state.isCallFlowActive}
+          />
         ) : data.trees.length === 0 ? (
           <div className="call-flow-empty">
             <span className="call-flow-empty-kicker">Snapshots match structurally</span>
@@ -307,8 +394,9 @@ export function ReviewCallFlowPanel() {
           <CallFlowTreeView
             trees={data.trees}
             onOpenNode={openNode}
-            onCommentNode={commentOnNode}
+            onAnnotateTargets={state.onAddCallFlowAnnotation}
             canInteractWithNode={state.isCallFlowNodeInPatch}
+            findShortcutActive={state.isCallFlowActive}
           />
         )}
 
@@ -319,38 +407,6 @@ export function ReviewCallFlowPanel() {
           </details>
         )}
 
-        {state.callFlowAdvert.languages && (
-          <details className="call-flow-languages">
-            <summary>Languages</summary>
-            <ul>
-              {state.callFlowAdvert.languages.map((language) => {
-                const languageInstallError = installFailedForLanguage(state.callFlowInstall.status, language.id)
-                  ? state.callFlowInstall.status
-                  : undefined;
-                return (
-                  <li key={language.id}>
-                    <span>
-                      <strong>{language.label}</strong>
-                      <small>{language.installed ? `Installed · ${formatInstallSize(language.installSizeBytes)}` : formatInstallSize(language.installSizeBytes)}</small>
-                      {languageInstallError && (
-                        <small className="call-flow-language-error">Install failed: {languageInstallError.error}</small>
-                      )}
-                    </span>
-                    {!language.installed && language.kind === 'pack' && state.callFlowAdvert.installable && (
-                      <button
-                        type="button"
-                        onClick={() => state.callFlowInstall.start([language.id])}
-                        disabled={state.callFlowInstall.status.state === 'running'}
-                      >
-                        {languageInstallError ? 'Retry' : 'Install'}
-                      </button>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
-          </details>
-        )}
       </div>
     </div>
   );

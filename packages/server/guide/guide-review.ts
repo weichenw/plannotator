@@ -24,10 +24,17 @@ import type {
   GuideDiffRef,
   GuideSection,
 } from "@plannotator/shared/guide";
+import type { GuideLaunchReview } from "@plannotator/shared/guide-format";
 
 export type { CodeGuideOutput, GuideDiffRef, GuideSection };
 
 export const GUIDE_EMPTY_OUTPUT_ERROR = "Guide generation returned empty or malformed output";
+
+/** Generic structural validation failure (no sections / blank overviews).
+ *  onJobComplete deliberately does NOT surface this string on the job card —
+ *  the caller substitutes GUIDE_EMPTY_OUTPUT_ERROR — whereas the informative
+ *  outside-changeset validation error passes through verbatim. */
+export const GUIDE_NO_SECTIONS_ERROR = "No sections survived validation";
 
 export const GUIDE_SCHEMA_JSON = JSON.stringify({
   type: "object",
@@ -67,6 +74,14 @@ export const GUIDE_SCHEMA_JSON = JSON.stringify({
   additionalProperties: false,
 });
 
+/**
+ * The Guided Review methodology. MIRRORED VERBATIM into the standalone
+ * `plannotator-guide` agent skill (github.com/plannotator/guides,
+ * skills/plannotator-guide/SKILL.md, section "2. Write the guide"), where only
+ * the mechanics differ (the diff is guide.patch, the output is guide.json).
+ * When this text changes, update the skill in the same change: a guide made by
+ * an agent must follow the same rules as one made in-app.
+ */
 export const GUIDE_REVIEW_PROMPT = `# Guided Review Organizer
 
 ## Identity
@@ -83,11 +98,20 @@ diff, but here is the key part" orientation a reviewer cannot get from
 reading files in path order.
 
 ## Voice
-Write like a colleague explaining the change to another capable engineer —
-at explain-like-I'm-new-here level: assume the reader is skilled but has
-never seen this codebase. Plain and direct; name things by what they do,
-expand project-specific shorthand the first time it appears, and never
-assume the reader knows the module layout.
+Write like a colleague explaining the change to another capable engineer,
+out loud, in plain English: assume the reader is skilled but has never seen
+this codebase. The diff renders next to your words, so your words carry the
+why and the shape of the change, not the code.
+- Short sentences. Twenty-five words is the ceiling and most sentences are
+  shorter. One idea per sentence. If you reach for a dash or a semicolon,
+  end the sentence instead.
+- Plain words. Say file, function, module, request, the server. Not
+  artifact, surface, primitive, chain, backbone. Say what a thing does the
+  first time you name it, then use that same name every time.
+- Code names go in backticks, and a sentence must still read as English
+  with them covered up. Two per sentence at most.
+- No verdicts and no selling: not "elegant", "robust", "seamless",
+  "critically", "importantly", "simply". State the fact.
 
 ## Speed
 You are handed the changeset directly. Reading it once, carefully, is 90%
@@ -227,8 +251,9 @@ accounted for.
   never neither.
 - Typically 2-6 sections. Never more than 10. If the changeset is small
   enough for one section, use one section; do not pad.
-- Never use em-dashes (—) anywhere in the output. Use commas, colons,
-  semicolons, parentheses, or separate sentences instead.
+- Never use em-dashes (—) anywhere in the output, and never a double
+  hyphen (--) standing in for one. Use commas, colons, or separate
+  sentences instead.
 - No emoji anywhere.
 - title: one line.
 - intent: 1-2 sentences, not a paragraph.
@@ -487,7 +512,7 @@ export async function buildGuideCodexCommand(options: {
     "exec",
     "--output-schema", schemaPath,
     "-o", outputPath,
-    "--full-auto", "--ephemeral",
+    "--approve-for-me", "--ephemeral",
     "-C", cwd,
     prompt,
   ];
@@ -948,6 +973,10 @@ export interface GuideSessionOnJobCompleteOptions {
    * switch never invalidates an otherwise-valid guide. Only falls back to
    * the current patch when a snapshot wasn't available (defensive). */
   changedFiles: string[];
+  /** The review this guide describes, captured at LAUNCH (decision record D6).
+   *  Recorded whether or not the output validates, so a later repair or
+   *  export sees the same diff the model was given. */
+  launchReview?: GuideLaunchReview;
 }
 
 export interface GuideSession {
@@ -965,10 +994,18 @@ export interface GuideSession {
    *  section placement against, not whatever patch happens to be on screen
    *  when the reviewer gets around to fixing the JSON. */
   launchChangedFiles: Map<string, string[]>;
+  /** Launch-time review per job id (patch + labels + source). In-memory
+   *  source of truth for exporting a live guide this session; the persisted
+   *  copy (guide-store) is authoritative for `saved:` ids and after restart.
+   *  Bounded to the most recent MAX_LAUNCH_REVIEWS jobs — each entry holds a
+   *  full patch. */
+  launchReviews: Map<string, GuideLaunchReview>;
   buildCommand(opts: GuideSessionBuildCommandOptions): Promise<GuideSessionBuildCommandResult>;
   onJobComplete(opts: GuideSessionOnJobCompleteOptions): Promise<{
     summary: GuideSessionJobSummary | null;
-    /** Sanitized provider failure when transport succeeded but the Pi run did not. */
+    /** Sanitized provider failure when transport succeeded but the Pi run did
+     *  not, or an informative validation failure worth showing verbatim on
+     *  the job card (refs outside the changeset under review). */
     error?: string;
   }>;
   getGuide(jobId: string): (CodeGuideOutput & { reviewed: boolean[] }) | null;
@@ -980,6 +1017,9 @@ export interface GuideSession {
    *  the FAILED job's own recorded set, rather than from whatever diff is on
    *  screen at repair time (see the repairOf branch in buildAgentJob). */
   getLaunchChangedFiles(jobId: string): string[] | null;
+  /** Launch-time review recorded for a job id, or null. Repairs reuse the
+   *  FAILED job's review the same way they reuse its changed-file set. */
+  getLaunchReview(jobId: string): GuideLaunchReview | null;
   /** Manually submit corrected guide JSON (mechanical repair -> parse ->
    *  validateGuideOutput) for a job whose automatic output failed. Success
    *  stores under the SAME job id the reviewed state is already keyed to.
@@ -995,6 +1035,9 @@ export interface GuideSession {
  *  growing the map unbounded; a manual repair attempt on a >200KB guide
  *  output is unlikely to succeed anyway. */
 const MAX_FAILED_PAYLOAD_CHARS = 200_000;
+
+/** Launch reviews retained per session (each holds a full patch). Oldest evicted first. */
+const MAX_LAUNCH_REVIEWS = 20;
 
 /**
  * Shared validation core for guide output: sanitize the raw sections /
@@ -1016,12 +1059,20 @@ export function validateGuideOutput(raw: unknown, changedFiles: string[]): { gui
   const placed = new Set<string>();
   const validatedSections: GuideSection[] = [];
   const sanitizedSections = sanitizeGuideSections(output.sections);
+  // Files the model referenced that are not part of the changeset — tracked
+  // so a fully-invalidated guide can explain WHY nothing survived (typically
+  // the model guided a different commit than the one under review).
+  const outsideChangeset = new Set<string>();
 
   for (const section of sanitizedSections) {
     const originalDiffCount = section.diffs.length;
     const diffs: GuideDiffRef[] = [];
     for (const ref of section.diffs) {
-      if (!changedSet.has(ref.file)) continue; // not a real changed file
+      if (!changedSet.has(ref.file)) {
+        // not a real changed file
+        outsideChangeset.add(ref.file);
+        continue;
+      }
       if (placed.has(ref.file)) continue; // duplicate — first placement wins
       placed.add(ref.file);
       diffs.push(ref);
@@ -1044,8 +1095,20 @@ export function validateGuideOutput(raw: unknown, changedFiles: string[]): { gui
   if (validatedSections.length === 0) {
     // Nothing survived validation — a guide screen with zero sections is
     // useless (it would just be a single "Everything else" bucket for the
-    // whole diff). Fail closed, same as an unparseable output.
-    return { error: "No sections survived validation" };
+    // whole diff). Fail closed, same as an unparseable output. When the
+    // sections died because their refs named files outside the changeset,
+    // say so — that failure is actionable (guide the right commit), unlike
+    // genuinely structural emptiness (no sections / blank overviews), which
+    // keeps the generic message.
+    if (outsideChangeset.size > 0) {
+      const examples = [...outsideChangeset].slice(0, 3).join(", ");
+      return {
+        error:
+          `Guide referenced ${outsideChangeset.size} file(s) outside the changeset under review ` +
+          `(e.g. ${examples}). To guide a different commit, open it in the Commits panel first, then relaunch.`,
+      };
+    }
+    return { error: GUIDE_NO_SECTIONS_ERROR };
   }
 
   // unplacedFiles = every changed file that never landed in a section,
@@ -1142,12 +1205,14 @@ export function createGuideSession(): GuideSession {
   const guideReviewed = new Map<string, boolean[]>();
   const failedPayloads = new Map<string, string>();
   const launchChangedFiles = new Map<string, string[]>();
+  const launchReviews = new Map<string, GuideLaunchReview>();
 
   return {
     guideResults,
     guideReviewed,
     failedPayloads,
     launchChangedFiles,
+    launchReviews,
 
     async buildCommand({ cwd, patch, diffType, options, prMetadata, changedFiles, config, repair }) {
       const engine = (typeof config?.engine === "string" ? config.engine : "claude") as "claude" | "codex" | MarkerEngineId;
@@ -1226,12 +1291,23 @@ export function createGuideSession(): GuideSession {
       return { command, stdinPrompt, prompt, cwd, label: "Guided Review", captureStdout: true, engine: "claude", model, effort };
     },
 
-    async onJobComplete({ job, meta, changedFiles }) {
+    async onJobComplete({ job, meta, changedFiles, launchReview }) {
       // Record the changed-file set this attempt validated against — BEFORE
       // parsing, so both the success and failure paths capture it. A later
       // manual repair (submitManualOutput) reuses this exact set instead of
       // whatever patch happens to be on screen at repair time.
       launchChangedFiles.set(job.id, changedFiles);
+      if (launchReview) {
+        // Same discipline for the review itself; bounded because each entry
+        // carries a full patch.
+        launchReviews.delete(job.id);
+        launchReviews.set(job.id, launchReview);
+        while (launchReviews.size > MAX_LAUNCH_REVIEWS) {
+          const oldest = launchReviews.keys().next().value;
+          if (oldest === undefined) break;
+          launchReviews.delete(oldest);
+        }
+      }
 
       let output: CodeGuideOutput | null = null;
       // Best-effort raw candidate for failed-payload capture — populated
@@ -1280,7 +1356,12 @@ export function createGuideSession(): GuideSession {
       if ("error" in result) {
         console.error(`[guide] ${result.error} for job ${job.id}`);
         stashFailedPayload(failedPayloads, job.id, rawCandidate);
-        return { summary: null };
+        // Surface only the informative outside-changeset explanation on the
+        // failure card; the generic structural case keeps the empty-output
+        // message the caller substitutes when `error` is absent.
+        return result.error === GUIDE_NO_SECTIONS_ERROR
+          ? { summary: null }
+          : { summary: null, error: result.error };
       }
 
       guideResults.set(job.id, result.guide);
@@ -1311,6 +1392,10 @@ export function createGuideSession(): GuideSession {
 
     getLaunchChangedFiles(jobId) {
       return launchChangedFiles.get(jobId) ?? null;
+    },
+
+    getLaunchReview(jobId) {
+      return launchReviews.get(jobId) ?? null;
     },
 
     submitManualOutput(jobId, payloadText, fallbackChangedFiles) {

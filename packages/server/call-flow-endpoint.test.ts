@@ -6,9 +6,10 @@ import { join } from 'node:path';
 import { startReviewServer as startBunReviewServer } from './review';
 import { startReviewServer as startPiReviewServer } from '../../apps/pi-extension/server';
 
-// The server imports above freeze shared/config.ts's CONFIG_PATH before any
-// per-test PLANNOTATOR_DATA_DIR override can take effect. Snapshot that exact
-// file so settings POSTs cannot leak into the developer's real configuration.
+// Config reads resolve the data dir lazily, so per-test PLANNOTATOR_DATA_DIR
+// sandboxes genuinely isolate settings POSTs. Snapshot the real config anyway
+// as a safety net: a regression back to a process-frozen config path must not
+// corrupt the developer's real configuration.
 const { getPlannotatorDataDir } = await import('@plannotator/shared/data-dir');
 const realConfigPath = join(getPlannotatorDataDir(), 'config.json');
 let realConfigSnapshot: Buffer | null = null;
@@ -21,6 +22,7 @@ try {
 const originalDataDir = process.env.PLANNOTATOR_DATA_DIR;
 const originalPort = process.env.PLANNOTATOR_PORT;
 const originalPath = process.env.PATH;
+const originalCallDiffPath = process.env.PLANNOTATOR_CALLDIFF_PATH;
 const tempDirs: string[] = [];
 
 function makeDataDir(): string {
@@ -56,6 +58,8 @@ afterEach(() => {
   else process.env.PLANNOTATOR_PORT = originalPort;
   if (originalPath === undefined) delete process.env.PATH;
   else process.env.PATH = originalPath;
+  if (originalCallDiffPath === undefined) delete process.env.PLANNOTATOR_CALLDIFF_PATH;
+  else process.env.PLANNOTATOR_CALLDIFF_PATH = originalCallDiffPath;
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -75,6 +79,53 @@ describe('Call flow endpoint capability guards', () => {
     ['Bun', startBunReviewServer],
     ['Pi', startPiReviewServer],
   ] as const) {
+    test(`${runtime} returns the server-authored install disclosure while Call flow is disabled`, async () => {
+      process.env.PLANNOTATOR_DATA_DIR = makeDataDir();
+      delete process.env.PLANNOTATOR_CALLDIFF_PATH;
+      if (runtime === 'Pi') process.env.PLANNOTATOR_PORT = String(await reservePort());
+      const server = await startServer({
+        rawPatch: [
+          'diff --git a/tool.py b/tool.py',
+          '--- a/tool.py',
+          '+++ b/tool.py',
+          '@@ -1 +1 @@',
+          '-pass',
+          "+print('changed')",
+        ].join('\n'),
+        gitRef: 'Working tree',
+        diffType: 'uncommitted',
+        origin: runtime === 'Pi' ? 'pi' : 'claude-code',
+        htmlContent: '<!doctype html><html><body>review</body></html>',
+      });
+
+      try {
+        const response = await fetch(`${server.url}/api/review-analysis`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ semanticDiff: false, callFlow: false }),
+        });
+        const settings = await response.json() as {
+          callFlow?: {
+            enabled: boolean;
+            state: string;
+            installable?: boolean;
+            consentPlan?: { languageIds: string[]; installSizeBytes: number };
+          };
+        };
+        expect(settings.callFlow).toMatchObject({
+          enabled: false,
+          state: 'disabled',
+          installable: true,
+          consentPlan: {
+            languageIds: ['javascript-typescript', 'python'],
+            installSizeBytes: 6 * 1024 * 1024,
+          },
+        });
+      } finally {
+        server.stop();
+      }
+    });
+
     test(`${runtime} returns unsupported for All Files before runtime execution`, async () => {
       process.env.PLANNOTATOR_DATA_DIR = makeDataDir();
       if (runtime === 'Pi') process.env.PLANNOTATOR_PORT = String(await reservePort());
@@ -90,6 +141,16 @@ describe('Call flow endpoint capability guards', () => {
         const initial = await fetch(`${server.url}/api/diff`).then((response) => response.json()) as {
           snapshotId: string;
         };
+        const disabled = await fetch(`${server.url}/api/review-analysis`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ semanticDiff: false, callFlow: false }),
+        }).then((response) => response.json()) as {
+          callFlow?: { state: string; reason?: string; consentPlan?: unknown };
+        };
+        expect(disabled.callFlow).toMatchObject({ state: 'disabled', reason: 'view-unsupported' });
+        expect(disabled.callFlow?.consentPlan).toBeUndefined();
+
         const settings = await fetch(`${server.url}/api/review-analysis`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -206,6 +267,11 @@ describe('Call flow endpoint capability guards', () => {
 
     test.skipIf(process.platform === 'win32')(`${runtime} stale read-only advert refresh yields to a newer settings mutation`, async () => {
       const dataDir = makeDataDir();
+      // The read-only GET only probes the node runtime while Call flow is
+      // enabled, so enable it in this test's own sandbox. (Before config
+      // reads became lazy this worked by accident: earlier tests' settings
+      // POSTs leaked callFlow=true through the process-frozen config path.)
+      writeFileSync(join(dataDir, 'config.json'), JSON.stringify({ reviewAnalysis: { callFlow: true } }), 'utf8');
       const binDir = mkdtempSync(join(tmpdir(), 'plannotator-call-flow-stale-read-node-'));
       tempDirs.push(binDir);
       const startedPath = join(binDir, 'started');
